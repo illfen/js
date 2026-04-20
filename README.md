@@ -63,6 +63,21 @@ const CONFIG = {
 };
 ```
 
+## How It Works
+
+This script **does not call backend APIs directly**. It automates button clicks on the page — all requests are sent by the page's own frontend framework.
+
+```
+Page loads → Intercept soldOut to enable buttons → Auto-click "Subscribe" at 10:00
+→ Auto-click confirm popup → CAPTCHA appears (manual) → QR code appears → Scan to pay
+```
+
+**The script cannot bypass CAPTCHAs.** If a slider or image verification appears after clicking the purchase button, you need to complete it manually. The script's value is:
+
+1. **Speed** — clicks at exactly 10:00:00, hundreds of ms faster than a human
+2. **Fewer steps** — auto-selects billing period, auto-clicks purchase and confirm, you only handle CAPTCHA + payment
+3. **Anti-cache** — intercepts `soldOut` flags so buttons don't stay grayed out due to stale frontend state
+
 ## Important Notes
 
 - **Buttons stay disabled outside the purchase window** — sold-out interception only activates during 9:59~10:05
@@ -145,6 +160,21 @@ const CONFIG = {
   maxRetries: 50,        // 最大重试次数
 };
 ```
+
+## 工作原理
+
+脚本**不会直接调用后端 API**，本质上就是替你点按钮，所有请求都由页面前端框架发出。
+
+```
+页面加载 → 拦截 soldOut 让按钮可点 → 10:00 自动点"特惠订阅"
+→ 自动点确认弹窗 → 弹出验证码（需手动完成）→ 弹出支付二维码 → 扫码付款
+```
+
+**脚本无法绕过验证码。** 如果点击购买按钮后弹出滑块或图形验证，需要你手动完成。脚本的价值在于：
+
+1. **抢时间** — 10:00:00 精准点击，比手动快几百毫秒
+2. **省操作** — 自动选包季、自动点购买、自动点确认，你只管过验证码 + 扫码付款
+3. **防缓存** — 拦截 `soldOut` 状态，防止按钮因前端缓存显示灰色
 
 ## 注意事项
 
