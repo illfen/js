@@ -21,18 +21,19 @@
     targetMinute: 0,
     targetSecond: 0,
     advanceMs: 200,           // 提前多少ms开始点击
-    retryInterval: 80,        // 点击间隔(ms)
-    maxRetries: 80,           // 最大重试次数
+    retryInterval: 100,       // 点击间隔(ms)
+    maxRetries: 300,          // 最大重试次数 (300次 * 100ms = 30秒)
   };
 
   let state = {
     retryCount: 0,
     isRunning: false,
     orderCreated: false,
+    modalVisible: false,
     timerId: null,
   };
 
-  // ===== 时间窗口检查: 只在 10:00 前1分钟 ~ 后5分钟内拦截 =====
+  // ===== 时间窗口检查: 只在 10:00 前1分钟 ~ 后60分钟内拦截 =====
   function isNearTarget() {
     const now = new Date(), t = new Date(now);
     t.setHours(CONFIG.targetHour, CONFIG.targetMinute, CONFIG.targetSecond, 0);
@@ -61,12 +62,25 @@
     return obj;
   }
 
-  // ===== 2. 拦截 fetch =====
+  // ===== 2. 拦截 fetch (自动重试 + soldOut修改) =====
   const _fetch = window.fetch;
   window.fetch = async function (...args) {
-    const res = await _fetch.apply(this, args);
-    if (!isNearTarget()) return res;
+    let res = await _fetch.apply(this, args);
     const url = typeof args[0] === 'string' ? args[0] : args[0]?.url || '';
+
+    // 抢购窗口内，失败请求自动重试
+    if (isNearTarget() && [429, 500, 502, 503].includes(res.status)) {
+      for (let retry = 1; retry <= 8; retry++) {
+        console.log(`[GLM Sniper] fetch ${res.status}，重试${retry}: ${url}`);
+        await new Promise(r => setTimeout(r, 300 * retry));
+        try {
+          res = await _fetch.apply(this, args);
+          if (res.ok) { console.log('[GLM Sniper] fetch 重试成功!'); break; }
+        } catch (e) {}
+      }
+    }
+
+    if (!isNearTarget()) return res;
     if (/coding|plan|order|subscribe|product|package/i.test(url)) {
       const clone = res.clone();
       try {
@@ -86,6 +100,95 @@
     }
     return res;
   };
+
+  // ===== 2b. XHR 拦截 (覆盖不走 fetch 的请求) =====
+  const _xhrOpen = XMLHttpRequest.prototype.open;
+  const _xhrSend = XMLHttpRequest.prototype.send;
+
+  XMLHttpRequest.prototype.open = function (method, url, ...rest) {
+    this._sniperUrl = url;
+    this._sniperMethod = method;
+    this._sniperArgs = null;
+    return _xhrOpen.call(this, method, url, ...rest);
+  };
+
+  XMLHttpRequest.prototype.send = function (...args) {
+    this._sniperArgs = args;
+    if (isNearTarget()) {
+      this.addEventListener('load', function xhrRetryHandler() {
+        if ([429, 500, 502, 503].includes(this.status)) {
+          console.log(`[GLM Sniper] XHR ${this.status}，1s后重试: ${this._sniperUrl}`);
+          const self = this;
+          setTimeout(() => {
+            _xhrOpen.call(self, self._sniperMethod, self._sniperUrl, true);
+            _xhrSend.apply(self, self._sniperArgs || []);
+          }, 1000);
+        }
+      });
+    }
+    return _xhrSend.apply(this, args);
+  };
+
+  // ===== 2c. 弹窗保护：检测验证码/支付弹窗，冻结刷新 =====
+  function setupModalProtector() {
+    new MutationObserver(() => {
+      const modals = document.querySelectorAll(
+        '[class*="modal"],[class*="dialog"],[class*="popup"],[role="dialog"]'
+      );
+      let foundRealModal = false;
+      for (const modal of modals) {
+        if (modal.offsetParent === null || modal.offsetHeight < 30) continue;
+        const text = modal.textContent || '';
+        const isCaptcha = text.includes('验证') || text.includes('滑动') || text.includes('拖动') ||
+                          modal.querySelector('[class*="captcha"],[class*="verify"],[class*="slider-"]');
+        const isPayment = text.includes('扫码') || text.includes('支付') || text.includes('付款') ||
+                          modal.querySelector('canvas, img[src*="qr"], img[src*="pay"]');
+        if (isCaptcha || isPayment) {
+          foundRealModal = true;
+          if (!state.modalVisible) {
+            state.modalVisible = true;
+            log('检测到' + (isCaptcha ? '验证码' : '支付') + '弹窗，已冻结刷新');
+            setStatus('请完成验证码 / 扫码支付!', '#fc0');
+            playBeep();
+          }
+          break;
+        }
+      }
+      if (!foundRealModal && state.modalVisible) {
+        state.modalVisible = false;
+        log('弹窗已消失，恢复自动抢购');
+      }
+    }).observe(document.body, { childList: true, subtree: true });
+  }
+
+  // ===== 2d. 错误页面 DOM 抑制 =====
+  function setupErrorSuppressor() {
+    new MutationObserver(() => {
+      if (!isNearTarget() || state.modalVisible) return;
+      const bodyText = document.body.textContent || '';
+      if (!bodyText.includes('访问人数较多') && !bodyText.includes('请刷新重试') && !bodyText.includes('服务繁忙')) return;
+
+      const errorNodes = document.querySelectorAll('div, section, p');
+      for (const node of errorNodes) {
+        const t = node.textContent || '';
+        if ((t.includes('访问人数较多') || t.includes('请刷新重试')) && node.offsetHeight > 50) {
+          node.style.display = 'none';
+          console.log('[GLM Sniper] 隐藏错误页面，触发重新加载...');
+          setTimeout(() => {
+            const currentUrl = window.location.href;
+            window.history.pushState(null, '', currentUrl);
+            window.dispatchEvent(new PopStateEvent('popstate', { state: null }));
+          }, 500);
+          setTimeout(() => {
+            const hash = window.location.hash;
+            window.location.hash = hash + '_retry';
+            setTimeout(() => { window.location.hash = hash; }, 100);
+          }, 1500);
+          break;
+        }
+      }
+    }).observe(document.body, { childList: true, subtree: true, characterData: true });
+  }
 
   // ===== 3. 悬浮窗 =====
   if (document.getElementById('glm-sniper-overlay')) {
@@ -109,6 +212,9 @@
       <div style="color:#fc0;margin-bottom:4px">目标: ${CONFIG.targetPlan.toUpperCase()} / ${{monthly:'包月',quarterly:'包季',yearly:'包年'}[CONFIG.billingPeriod]||'包季'}</div>
       <div id="glm-cd" style="font-size:22px;margin:6px 0;color:#fff">--:--:--</div>
       <div id="glm-st" style="color:#aaa;font-size:12px">就绪</div>
+      <div style="color:#f44;font-size:12px;margin-top:6px;font-weight:bold;line-height:1.4;">
+        ⚠ 如果订单没有显示需要支付的金额，请不要扫码付款！
+      </div>
       <div id="glm-log" style="
         margin-top:8px;max-height:100px;overflow-y:auto;
         font-size:11px;color:#888;
@@ -190,15 +296,23 @@
     selectBilling();
     unlock();
     state.timerId = setInterval(() => {
-      if (state.orderCreated || state.retryCount >= CONFIG.maxRetries) {
+      if (state.orderCreated) {
         clearInterval(state.timerId);
-        if (!state.orderCreated) {
-          log('超时，请手动操作');
-          setStatus('抢购超时', '#f44');
-        }
+        return;
+      }
+      if (state.retryCount >= CONFIG.maxRetries) {
+        clearInterval(state.timerId);
+        // 重置状态，允许 setupAutoSnipeOnReady 重新触发
+        state.isRunning = false;
+        state.retryCount = 0;
+        log('本轮重试结束，等待页面恢复后重新触发...');
+        setStatus('等待页面恢复...', '#fc0');
         return;
       }
       state.retryCount++;
+      if (state.retryCount % 10 === 1) {
+        log('第 ' + state.retryCount + ' 次尝试...');
+      }
       unlock();
       if (clickBuy()) {
         log('已点击购买按钮!');
@@ -223,7 +337,7 @@
   }
 
   function clickBuy() {
-    const buyWords = ['购买', '订阅', '订购', '立即购买', '立即订阅', '特惠购买', 'Subscribe', 'Buy'];
+    const buyWords = ['购买', '订阅', '订购', '立即购买', '立即订阅', '特惠购买', '特惠订阅', 'Subscribe', 'Buy'];
     const planWords = {
       lite: ['lite', 'Lite', 'LITE', '基础', '轻量'],
       pro: ['pro', 'Pro', 'PRO', '专业', '进阶'],
@@ -312,6 +426,27 @@
     }
   }).observe(document.body, { childList: true, subtree: true });
 
+  // ===== 7. 页面恢复后自动触发抢购 =====
+  function setupAutoSnipeOnReady() {
+    setInterval(() => {
+      const now = new Date();
+      if (now.getHours() !== CONFIG.targetHour) return;
+      if (state.isRunning || state.orderCreated || state.modalVisible) return;
+
+      const bodyText = document.body?.textContent || '';
+      const hasError = ['访问人数较多', '请刷新重试', '服务繁忙'].some(kw => bodyText.includes(kw));
+      if (hasError) return;
+
+      const hasBuyButton = ['购买', '订阅', '订购', '特惠订阅', '特惠购买'].some(kw => bodyText.includes(kw));
+      if (!hasBuyButton) return;
+
+      log('页面恢复正常，自动触发抢购!');
+      setStatus('页面恢复，正在抢购...', '#0f8');
+      state.isRunning = true;
+      startSnipe();
+    }, 2000);
+  }
+
   function playBeep() {
     try {
       const c = new AudioContext();
@@ -324,10 +459,14 @@
     } catch (e) {}
   }
 
-  // ===== 7. 立即执行一次解锁 =====
+  // ===== 8. 启动 =====
+  setupModalProtector();
+  setupErrorSuppressor();
+  setupAutoSnipeOnReady();
   unlock();
   log('脚本已启动 - 目标: ' + CONFIG.targetPlan.toUpperCase());
   log('到 ' + CONFIG.targetHour + ':00 自动抢购');
+  log('页面异常自动恢复，弹窗自动冻结刷新');
   setStatus('等待中...', '#aaa');
 
   // 如果现在刚好是10:00

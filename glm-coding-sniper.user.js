@@ -28,8 +28,8 @@
     advanceMs: 200,
     // 点击重试间隔(ms)
     retryInterval: 100,
-    // 最大重试次数
-    maxRetries: 50,
+    // 最大重试次数 (300次 * 100ms = 30秒)
+    maxRetries: 300,
     // 是否自动刷新页面 (在9:59:50自动刷新一次以获取最新状态)
     autoRefresh: true,
     autoRefreshSecondsBefore: 10,
@@ -174,27 +174,37 @@
     }
 
     new MutationObserver(() => {
-      // 检测是否有弹窗（验证码、支付二维码等）
+      // 只检测真正的验证码/支付弹窗，避免误判普通页面元素
       const modals = document.querySelectorAll(
-        '[class*="modal"],[class*="dialog"],[class*="popup"],[class*="captcha"],[class*="verify"],' +
-        '[class*="slider"],[role="dialog"],[class*="mask"]'
+        '[class*="modal"],[class*="dialog"],[class*="popup"],[role="dialog"]'
       );
+      let foundRealModal = false;
       for (const modal of modals) {
-        if (modal.offsetParent !== null && modal.offsetHeight > 30) {
+        if (modal.offsetParent === null || modal.offsetHeight < 30) continue;
+        // 必须包含验证码或支付相关内容才算真正的弹窗
+        const text = modal.textContent || '';
+        const isCaptcha = text.includes('验证') || text.includes('滑动') || text.includes('拖动') ||
+                          modal.querySelector('[class*="captcha"],[class*="verify"],[class*="slider-"]');
+        const isPayment = text.includes('扫码') || text.includes('支付') || text.includes('付款') ||
+                          modal.querySelector('canvas, img[src*="qr"], img[src*="pay"]');
+        if (isCaptcha || isPayment) {
+          foundRealModal = true;
           if (!state.modalVisible) {
             state.modalVisible = true;
-            console.log('[GLM Sniper] 检测到弹窗! 冻结所有刷新，保护弹窗');
-            log('检测到弹窗（验证码/支付），已冻结刷新');
+            const type = isCaptcha ? '验证码' : '支付';
+            console.log(`[GLM Sniper] 检测到${type}弹窗! 冻结刷新`);
+            log(`检测到${type}弹窗，已冻结刷新`);
             setStatus('请完成验证码 / 扫码支付!', '#ffcc00');
             playAlert();
           }
-          return;
+          break;
         }
       }
-      // 弹窗消失了（用户完成了验证 or 被关闭）
-      if (state.modalVisible) {
+      // 没有真正的弹窗了
+      if (!foundRealModal && state.modalVisible) {
         state.modalVisible = false;
         console.log('[GLM Sniper] 弹窗已消失，恢复正常');
+        log('弹窗已消失，恢复自动抢购');
       }
     }).observe(document.body, { childList: true, subtree: true });
   }
@@ -286,6 +296,9 @@
         </div>
         <div id="glm-status" style="color: #aaa; font-size: 12px;">
           等待初始化...
+        </div>
+        <div style="color:#f44;font-size:12px;margin-top:6px;font-weight:bold;line-height:1.4;">
+          ⚠ 如果订单没有显示需要支付的金额，请不要扫码付款！
         </div>
         <div id="glm-log" style="
           margin-top: 8px;
@@ -420,17 +433,24 @@
 
     // 开始循环尝试点击
     state.timerId = setInterval(() => {
-      if (state.orderCreated || state.retryCount >= CONFIG.maxRetries) {
+      if (state.orderCreated) {
         clearInterval(state.timerId);
-        if (!state.orderCreated) {
-          log('达到最大重试次数');
-          setStatus('抢购超时，请手动操作', '#ff4444');
-        }
+        return;
+      }
+      if (state.retryCount >= CONFIG.maxRetries) {
+        clearInterval(state.timerId);
+        // 重置状态，允许 setupAutoSnipeOnReady 重新触发
+        state.isRunning = false;
+        state.retryCount = 0;
+        log('本轮重试结束，等待页面恢复后重新触发...');
+        setStatus('等待页面恢复...', '#ffcc00');
         return;
       }
 
       state.retryCount++;
-      log(`第 ${state.retryCount} 次尝试...`);
+      if (state.retryCount % 10 === 1) {
+        log(`第 ${state.retryCount} 次尝试...`);
+      }
 
       // 移除disabled
       removeAllDisabled();
@@ -750,9 +770,9 @@
   // ==================== 10. 启动 ====================
   function init() {
     // 启动错误恢复
-    setupAutoRetryRefresh();   // 全页面级别的强刷兜底
-    setupErrorSuppressor();    // DOM级别的错误抑制 + SPA路由重试
-    setupModalProtector();     // 弹窗保护（验证码/支付）
+    setupAutoRetryRefresh(); // 全页面级别的强刷兜底
+    setupErrorSuppressor(); // DOM级别的错误抑制 + SPA路由重试
+    setupModalProtector(); // 弹窗保护（验证码/支付）
 
     createOverlay();
     setupMutationObserver();
