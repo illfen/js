@@ -52,8 +52,8 @@
     const target = new Date(now);
     target.setHours(CONFIG.targetHour, CONFIG.targetMinute, CONFIG.targetSecond, 0);
     const diff = target - now;
-    // 前1分钟 到 后15分钟 的窗口期内才拦截
-    return diff <= 60000 && diff >= -900000;
+    // 前1分钟 到 后60分钟 的窗口期内才拦截
+    return diff <= 60000 && diff >= -3600000;
   }
 
   const originalParse = JSON.parse;
@@ -684,7 +684,7 @@
       const now = new Date();
       const h = now.getHours(), m = now.getMinutes();
       // 10:00 ~ 10:30 窗口内持续尝试恢复
-      const inWindow = h === CONFIG.targetHour && m < 30;
+      const inWindow = h === CONFIG.targetHour;
       if (!inWindow) return;
       // 有弹窗时绝不刷新（保护验证码/支付弹窗）
       if (state.modalVisible) return;
@@ -728,7 +728,7 @@
     setInterval(() => {
       const now = new Date();
       const h = now.getHours(), m = now.getMinutes();
-      if (h !== CONFIG.targetHour || m > 15) return;
+      if (h !== CONFIG.targetHour) return;
       if (state.isRunning || state.orderCreated || state.modalVisible) return;
 
       // 检测页面是否有购买按钮（说明页面正常加载了）
@@ -771,7 +771,7 @@
     const now = new Date();
     if (
       now.getHours() === CONFIG.targetHour &&
-      now.getMinutes() <= 15
+      now.getMinutes() <= 59
     ) {
       log('当前正是抢购时间! 立即开始!');
       state.isRunning = true;

@@ -37,7 +37,7 @@
     const now = new Date(), t = new Date(now);
     t.setHours(CONFIG.targetHour, CONFIG.targetMinute, CONFIG.targetSecond, 0);
     const diff = t - now;
-    return diff <= 60000 && diff >= -300000;
+    return diff <= 60000 && diff >= -3600000;
   }
 
   // ===== 1. 拦截 JSON.parse =====
@@ -332,7 +332,7 @@
 
   // 如果现在刚好是10:00
   const now = new Date();
-  if (now.getHours() === CONFIG.targetHour && now.getMinutes() === CONFIG.targetMinute && now.getSeconds() <= 5) {
+  if (now.getHours() === CONFIG.targetHour && now.getMinutes() >= CONFIG.targetMinute) {
     log('现在就是抢购时间!');
     state.isRunning = true;
     startSnipe();
