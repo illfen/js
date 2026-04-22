@@ -42,6 +42,29 @@
     return diff <= 60000 && diff >= -1800000;
   }
 
+  // ===== 售罄确认机制 =====
+  let _soldOutCount = 0;
+  let _confirmedSoldOut = false;
+
+  function isInRushWindow() {
+    const now = new Date(), t = new Date(now);
+    t.setHours(CONFIG.targetHour, CONFIG.targetMinute, CONFIG.targetSecond, 0);
+    const elapsed = now - t;
+    return elapsed >= 0 && elapsed < 120000;
+  }
+
+  function shouldInterceptSoldOut() {
+    if (_confirmedSoldOut) return false;
+    if (isInRushWindow()) return true;
+    if (_soldOutCount >= 30) {
+      _confirmedSoldOut = true;
+      log('连续检测到售罄状态，确认已售罄');
+      setStatus('已确认售罄，明天再来', '#f44');
+      return false;
+    }
+    return true;
+  }
+
   // ===== 1. 拦截 JSON.parse =====
   const _parse = JSON.parse;
   JSON.parse = function (...args) {
@@ -58,8 +81,13 @@
     if (Array.isArray(obj)) return obj.map(fixSoldOut);
     for (const k of Object.keys(obj)) {
       if (/sold.?out/i.test(k) && obj[k] === true) {
-        obj[k] = false;
-        log('[拦截] ' + k + ' -> false');
+        _soldOutCount++;
+        if (shouldInterceptSoldOut()) {
+          obj[k] = false;
+          log('[拦截] ' + k + ' -> false (连续' + _soldOutCount + '次)');
+        }
+      } else if (/sold.?out/i.test(k)) {
+        _soldOutCount = 0;
       }
       if (k === 'isServerBusy' && obj[k] === true) {
         obj[k] = false;
@@ -225,6 +253,26 @@
   };
 
   XMLHttpRequest.prototype.send = function (...args) {
+    const url = this._sniperUrl || '';
+
+    // XHR preview 请求: 捕获 + 注入 productId
+    if (/preview/i.test(url) && args[0]) {
+      try {
+        let bodyObj = typeof args[0] === 'string' ? JSON.parse(args[0]) : null;
+        if (bodyObj) {
+          if (bodyObj.productId) {
+            _capturedProductId = bodyObj.productId;
+            log('[捕获] productId=' + _capturedProductId + ' (XHR)');
+          }
+          if (!bodyObj.productId && _capturedProductId) {
+            bodyObj.productId = _capturedProductId;
+            args[0] = JSON.stringify(bodyObj);
+            log('[注入] 已补充 productId=' + _capturedProductId + ' (XHR)');
+          }
+        }
+      } catch (e) {}
+    }
+
     this._sniperArgs = args;
     if (isNearTarget()) {
       this.addEventListener('load', function xhrRetryHandler() {

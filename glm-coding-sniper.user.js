@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         GLM Coding Plan Pro 自动抢购
 // @namespace    https://bigmodel.cn
-// @version      1.2.2
+// @version      1.2.3
 // @description  每天10:00自动抢购GLM Coding Plan Pro套餐，拦截售罄+自动点击+错误恢复+弹窗保护+自动重触发
 // @author       qiandai
 // @match        https://open.bigmodel.cn/*
@@ -57,6 +57,32 @@
     return diff <= 60000 && diff >= -1800000;
   }
 
+  // 售罄确认机制：前2分钟无条件拦截，之后连续N次soldOut则判定为真正售罄
+  let _soldOutCount = 0;          // 连续 soldOut 计数
+  let _confirmedSoldOut = false;  // 是否已确认售罄
+
+  function isInRushWindow() {
+    // 10:00 后前2分钟 = 黄金抢购窗口，无条件拦截
+    const now = new Date();
+    const target = new Date(now);
+    target.setHours(CONFIG.targetHour, CONFIG.targetMinute, CONFIG.targetSecond, 0);
+    const elapsed = now - target; // 过了多久
+    return elapsed >= 0 && elapsed < 120000; // 0~2分钟
+  }
+
+  function shouldInterceptSoldOut() {
+    if (_confirmedSoldOut) return false;
+    if (isInRushWindow()) return true; // 前2分钟无条件拦截
+    // 2分钟后：连续30次soldOut → 确认售罄
+    if (_soldOutCount >= 30) {
+      _confirmedSoldOut = true;
+      log('连续检测到售罄状态，确认已售罄');
+      setStatus('已确认售罄，明天再来', '#ff4444');
+      return false;
+    }
+    return true;
+  }
+
   const originalParse = JSON.parse;
   JSON.parse = function (...args) {
     let result = originalParse.apply(this, args);
@@ -90,8 +116,14 @@
         key === 'sold_out'
       ) {
         if (obj[key] === true) {
-          obj[key] = false;
-          log(`[拦截] 将 ${key} 从 true 改为 false`);
+          _soldOutCount++;
+          if (shouldInterceptSoldOut()) {
+            obj[key] = false;
+            log(`[拦截] 将 ${key} 从 true 改为 false (连续${_soldOutCount}次)`);
+          }
+        } else {
+          // 非 soldOut → 重置计数
+          _soldOutCount = 0;
         }
       }
       if (key === 'isServerBusy' && obj[key] === true) {
@@ -196,11 +228,18 @@
       } catch (e) {}
     }
 
-    // soldOut 拦截
-    if (!isNearTargetTime()) return response;
+    // soldOut 拦截 (已确认售罄则跳过)
+    if (!isNearTargetTime() || _confirmedSoldOut) return response;
     if (/coding|plan|order|subscribe|product|package/i.test(url)) {
       try {
         const text = await response.clone().text();
+        if (!shouldInterceptSoldOut()) {
+          return new Response(text, {
+            status: response.status,
+            statusText: response.statusText,
+            headers: response.headers,
+          });
+        }
         const modified = text
           .replace(/"isSoldOut"\s*:\s*true/g, '"isSoldOut":false')
           .replace(/"soldOut"\s*:\s*true/g, '"soldOut":false')
@@ -277,6 +316,26 @@
   };
 
   XMLHttpRequest.prototype.send = function (...args) {
+    const url = this._sniperUrl || '';
+
+    // XHR preview 请求: 捕获 + 注入 productId
+    if (/preview/i.test(url) && args[0]) {
+      try {
+        let bodyObj = typeof args[0] === 'string' ? JSON.parse(args[0]) : null;
+        if (bodyObj) {
+          if (bodyObj.productId) {
+            _capturedProductId = bodyObj.productId;
+            log(`[捕获] productId=${_capturedProductId} (XHR)`);
+          }
+          if (!bodyObj.productId && _capturedProductId) {
+            bodyObj.productId = _capturedProductId;
+            args[0] = JSON.stringify(bodyObj);
+            log(`[注入] 已补充 productId=${_capturedProductId} (XHR)`);
+          }
+        }
+      } catch (e) {}
+    }
+
     this._sniperArgs = args;
     if (isNearTargetTime()) {
       this.addEventListener('load', function xhrRetryHandler() {
@@ -284,7 +343,6 @@
           console.log(`[GLM Sniper] XHR ${this.status}，1s后重试: ${this._sniperUrl}`);
           const self = this;
           setTimeout(() => {
-            // 用原始方法重新打开并发送
             _xhrOpen.call(self, self._sniperMethod, self._sniperUrl, true);
             _xhrSend.apply(self, self._sniperArgs || []);
           }, 1000);
