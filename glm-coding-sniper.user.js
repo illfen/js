@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         GLM Coding Plan Pro 自动抢购
 // @namespace    https://bigmodel.cn
-// @version      1.2.3
+// @version      1.2.5
 // @description  每天10:00自动抢购GLM Coding Plan Pro套餐，拦截售罄+自动点击+错误恢复+弹窗保护+自动重触发
 // @author       qiandai
 // @match        https://open.bigmodel.cn/*
@@ -13,6 +13,14 @@
 
 (function () {
   'use strict';
+
+  // ==================== 0. 限流页面早期退出 ====================
+  // 在 rate-limit 页面上运行会触发 CSP 错误，直接跳回购买页
+  if (window.location.pathname.includes('rate-limit') || window.location.href.includes('rate-limit.html')) {
+    console.log('[GLM Sniper] 检测到限流页，跳回购买页...');
+    setTimeout(() => window.location.replace('https://open.bigmodel.cn/glm-coding'), 1000);
+    return;
+  }
 
   // ==================== 配置 ====================
   const CONFIG = {
@@ -73,20 +81,33 @@
   function shouldInterceptSoldOut() {
     if (_confirmedSoldOut) return false;
     if (isInRushWindow()) return true; // 前2分钟无条件拦截
-    // 2分钟后：连续30次soldOut → 确认售罄
-    if (_soldOutCount >= 30) {
-      _confirmedSoldOut = true;
-      log('连续检测到售罄状态，确认已售罄');
-      setStatus('已确认售罄，明天再来', '#ff4444');
+    // 2分钟后：连续3次soldOut → 快速确认售罄（每次API调用约3个plan，1次调用即可确认）
+    if (_soldOutCount >= 3) {
+      confirmSoldOut();
       return false;
     }
     return true;
+  }
+
+  function confirmSoldOut() {
+    if (_confirmedSoldOut) return;
+    _confirmedSoldOut = true;
+    log('已确认售罄，停止抢购');
+    setStatus('已售罄，明日再抢', '#ff4444');
+    // 停止所有正在运行的抢购逻辑
+    if (state.timerId) { clearInterval(state.timerId); state.timerId = null; }
+    state.isRunning = false;
   }
 
   const originalParse = JSON.parse;
   JSON.parse = function (...args) {
     let result = originalParse.apply(this, args);
     try {
+      // 始终捕获 productId（不受时间窗口限制，页面加载时就捕获）
+      if (!_capturedProductId) {
+        captureProductIdFromData(result);
+      }
+      // soldOut 拦截只在抢购窗口期内
       if (isNearTargetTime()) {
         result = deepModifySoldOut(result);
       }
@@ -100,6 +121,96 @@
   Object.defineProperty(JSON.parse, 'toString', {
     value: () => 'function parse() { [native code] }',
   });
+
+  // 从 batch-preview 响应中按价格+折扣识别目标套餐的 productId
+  // API 返回的 productList 没有 name 字段，只能通过价格区分套餐:
+  //   Lite: monthlyOriginalAmount=49, Pro: =149, Max: =469
+  // 计费周期通过 campaignDiscountDetails 区分:
+  //   monthly: 无折扣, quarterly: "包季", yearly: "包年"
+  let _allProductIds = {}; // { 'lite_monthly': productId, ... }
+
+  const PLAN_PRICE_MAP = { lite: 49, pro: 149, max: 469 };
+
+  function identifyPlanFromProduct(item) {
+    const price = item.monthlyOriginalAmount;
+    let plan = null;
+    for (const [name, p] of Object.entries(PLAN_PRICE_MAP)) {
+      if (price === p) { plan = name; break; }
+    }
+    if (!plan) return null;
+
+    let period = 'monthly';
+    const campaigns = item.campaignDiscountDetails || [];
+    for (const c of campaigns) {
+      const cn = c.campaignName || '';
+      if (cn.includes('包季')) { period = 'quarterly'; break; }
+      if (cn.includes('包年')) { period = 'yearly'; break; }
+    }
+    return { plan, period };
+  }
+
+  function captureProductIdFromData(obj) {
+    if (!obj || typeof obj !== 'object') return;
+
+    // 检测 batch-preview 响应结构: { data: { productList: [...] } }
+    if (obj.productList && Array.isArray(obj.productList)) {
+      for (const item of obj.productList) {
+        if (!item || !item.productId) continue;
+        const info = identifyPlanFromProduct(item);
+        if (!info) continue;
+        const key = `${info.plan}_${info.period}`;
+        _allProductIds[key] = item.productId;
+        if (info.plan === CONFIG.targetPlan && info.period === CONFIG.billingPeriod) {
+          _capturedProductId = item.productId;
+          _capturedProductInfo = item;
+          log(`[捕获] productId=${item.productId} (${CONFIG.targetPlan}/${CONFIG.billingPeriod})`);
+        }
+      }
+      if (Object.keys(_allProductIds).length > 0 && !_capturedProductId) {
+        log(`[捕获] 找到${Object.keys(_allProductIds).length}个产品，但未匹配目标套餐`);
+      }
+      return;
+    }
+
+    // 递归搜索嵌套的 data 字段
+    if (Array.isArray(obj)) {
+      for (const item of obj) {
+        if (item && typeof item === 'object') captureProductIdFromData(item);
+      }
+    } else {
+      for (const v of Object.values(obj)) {
+        if (v && typeof v === 'object') captureProductIdFromData(v);
+      }
+    }
+  }
+
+  // 获取 productId（含备选列表回退）
+  function getProductId() {
+    if (_capturedProductId) return _capturedProductId;
+    // 精确匹配
+    const exactKey = `${CONFIG.targetPlan}_${CONFIG.billingPeriod}`;
+    if (_allProductIds[exactKey]) {
+      _capturedProductId = _allProductIds[exactKey];
+      log(`[回退] 精确匹配 productId=${_capturedProductId} (${exactKey})`);
+      return _capturedProductId;
+    }
+    // 同套餐不同周期
+    for (const [key, pid] of Object.entries(_allProductIds)) {
+      if (key.startsWith(CONFIG.targetPlan + '_')) {
+        _capturedProductId = pid;
+        log(`[回退] 同套餐匹配 productId=${pid} (${key})`);
+        return pid;
+      }
+    }
+    // 最后回退：任意可用
+    const entries = Object.entries(_allProductIds);
+    if (entries.length > 0) {
+      _capturedProductId = entries[0][1];
+      log(`[回退] 使用首个可用 productId=${_capturedProductId} (${entries[0][0]})`);
+      return _capturedProductId;
+    }
+    return null;
+  }
 
   function deepModifySoldOut(obj) {
     if (obj === null || typeof obj !== 'object') return obj;
@@ -140,8 +251,9 @@
 
   // ==================== 2. 拦截 fetch + XHR (自动重试 + soldOut修改) ====================
 
-  // 捕获的 productId (从 API 响应或请求中提取)
+  // 捕获的 productId (从 JSON.parse / API 响应 / 请求中提取)
   let _capturedProductId = null;
+  let _capturedProductInfo = null; // 完整的产品信息
 
   // --- 2a. fetch 拦截 ---
   const originalFetch = window.fetch;
@@ -605,6 +717,8 @@
 
   // ==================== 4b. TCP 预热 ====================
   async function preheat() {
+    // 只在目标站点执行，避免跨域 CSP 错误
+    if (location.hostname !== 'open.bigmodel.cn') return;
     log('TCP 预热中...');
     try {
       const paths = ['/favicon.ico', '/api/biz/pay/check?bizId=preheat', '/'];
@@ -641,6 +755,14 @@
   }
 
   function startSnipe() {
+    // 已确认售罄时不启动抢购
+    if (_confirmedSoldOut) {
+      log('已确认售罄，不启动抢购');
+      setStatus('已售罄，明日再抢', '#ff4444');
+      state.isRunning = false;
+      return;
+    }
+
     // 先选择计费周期
     selectBillingPeriod();
     // 移除所有disabled属性
@@ -648,6 +770,15 @@
 
     // 开始循环尝试点击
     state.timerId = setInterval(() => {
+      // 运行中确认售罄 → 立即停止
+      if (_confirmedSoldOut) {
+        clearInterval(state.timerId);
+        state.timerId = null;
+        state.isRunning = false;
+        log('已确认售罄，停止抢购');
+        setStatus('已售罄，明日再抢', '#ff4444');
+        return;
+      }
       if (state.orderCreated) {
         clearInterval(state.timerId);
         return;
@@ -893,8 +1024,10 @@
 
   // ==================== 7. 时间校准 (使用服务器时间) ====================
   async function calibrateTime() {
+    // 只在目标站点执行，避免跨域 CSP 错误
+    if (location.hostname !== 'open.bigmodel.cn') return;
     try {
-      const res = await originalFetch('https://open.bigmodel.cn/', {
+      const res = await originalFetch(location.origin + '/', {
         method: 'HEAD',
         cache: 'no-cache',
       });
@@ -979,7 +1112,7 @@
       const now = new Date();
       const h = now.getHours(), m = now.getMinutes();
       if (h !== CONFIG.targetHour || m > 30) return;
-      if (state.isRunning || state.orderCreated || state.modalVisible) return;
+      if (state.isRunning || state.orderCreated || state.modalVisible || _confirmedSoldOut) return;
 
       // 检测页面是否有购买按钮（说明页面正常加载了）
       const bodyText = document.body?.textContent || '';
@@ -1001,32 +1134,54 @@
 
   // 确保 Vue 组件中 productId 存在，防止验证码后数据丢失
   function ensureProductId() {
+    const pid = getProductId();
+    if (!pid) {
+      log('[Vue] 没有捕获到 productId，无法恢复');
+      return;
+    }
+
     const app = document.querySelector('#app');
     const vue = app?.__vue__;
     if (!vue) return;
 
+    let fixed = 0;
     const walk = (vm, depth) => {
-      if (depth > 8) return;
-      // 查找包含 productId 的组件
+      if (depth > 10) return;
       if (vm.$data) {
-        // 如果 productId 为空但有可用的产品列表，自动填充
-        if (('productId' in vm.$data) && !vm.$data.productId) {
-          // 尝试从产品列表中找到目标套餐的 productId
-          const products = vm.$data.products || vm.$data.productList || vm.$data.planList || [];
-          for (const p of products) {
-            const name = (p.name || p.title || p.planName || '').toLowerCase();
-            if (name.includes(CONFIG.targetPlan)) {
-              vm.productId = p.productId || p.id;
-              log(`[Vue] 已恢复 productId=${vm.productId}`);
-              return;
-            }
+        // 搜索所有包含 productId 相关字段的组件，强制设置
+        for (const key of Object.keys(vm.$data)) {
+          if (/product.?id/i.test(key) && !vm.$data[key]) {
+            vm[key] = _capturedProductId;
+            fixed++;
+            log(`[Vue] 已设置 ${key}=${_capturedProductId}`);
           }
-          log('[Vue] productId 为空，未找到匹配的产品数据');
         }
       }
       for (const child of (vm.$children || [])) walk(child, depth + 1);
     };
     walk(vue, 0);
+
+    if (fixed === 0) {
+      // 没找到空的 productId 字段，尝试通过 $set 或直接赋值
+      log('[Vue] 未找到空的 productId 字段，尝试广搜...');
+      const walkAll = (vm, depth) => {
+        if (depth > 10 || fixed > 0) return;
+        if (vm.$data) {
+          const keys = Object.keys(vm.$data);
+          // 找到有 productId 字段的组件（不管是否为空）
+          for (const key of keys) {
+            if (/product.?id/i.test(key)) {
+              vm[key] = _capturedProductId;
+              fixed++;
+              log(`[Vue] 强制设置 ${key}=${_capturedProductId}`);
+              return;
+            }
+          }
+        }
+        for (const child of (vm.$children || [])) walkAll(child, depth + 1);
+      };
+      walkAll(vue, 0);
+    }
   }
 
   // 抢购成功后，如果支付弹窗没自动弹出，直接操作 Vue 组件
@@ -1082,9 +1237,14 @@
     setupMutationObserver();
     setupAutoSnipeOnReady();   // 页面恢复后自动触发抢购
 
-    // 延迟校准时间 + patch Vue isServerBusy
+    // 延迟校准时间 + patch Vue isServerBusy + 定期捕获 productId
     setTimeout(calibrateTime, 2000);
     patchVueServerBusy();
+    // 定期检查 productId 是否已捕获（直到成功）
+    const pidTimer = setInterval(() => {
+      if (_capturedProductId) { clearInterval(pidTimer); return; }
+      getProductId();
+    }, 3000);
 
     log(`脚本已启动 - 目标: ${CONFIG.targetPlan.toUpperCase()}`);
     log(`抢购时间: 每天 ${CONFIG.targetHour}:${String(CONFIG.targetMinute).padStart(2, '0')}:${String(CONFIG.targetSecond).padStart(2, '0')}`);
@@ -1096,11 +1256,19 @@
     const now = new Date();
     if (
       now.getHours() === CONFIG.targetHour &&
-      now.getMinutes() <= 59
+      now.getMinutes() <= 30
     ) {
-      log('当前正是抢购时间! 立即开始!');
-      state.isRunning = true;
-      startSnipe();
+      // 延迟2秒等待 API 数据加载，以便售罄检测生效
+      setTimeout(() => {
+        if (_confirmedSoldOut) {
+          log('已确认售罄，不启动抢购');
+          setStatus('已售罄，明日再抢', '#ff4444');
+          return;
+        }
+        log('当前正是抢购时间! 立即开始!');
+        state.isRunning = true;
+        startSnipe();
+      }, 2000);
     }
   }
 

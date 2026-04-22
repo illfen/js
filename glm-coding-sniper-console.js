@@ -56,25 +56,106 @@
   function shouldInterceptSoldOut() {
     if (_confirmedSoldOut) return false;
     if (isInRushWindow()) return true;
-    if (_soldOutCount >= 30) {
-      _confirmedSoldOut = true;
-      log('连续检测到售罄状态，确认已售罄');
-      setStatus('已确认售罄，明天再来', '#f44');
+    if (_soldOutCount >= 3) {
+      confirmSoldOut();
       return false;
     }
     return true;
+  }
+
+  function confirmSoldOut() {
+    if (_confirmedSoldOut) return;
+    _confirmedSoldOut = true;
+    log('已确认售罄，停止抢购');
+    setStatus('已售罄，明日再抢', '#f44');
+    if (state.timerId) { clearInterval(state.timerId); state.timerId = null; }
+    state.isRunning = false;
   }
 
   // ===== 1. 拦截 JSON.parse =====
   const _parse = JSON.parse;
   JSON.parse = function (...args) {
     let r = _parse.apply(this, args);
-    try { if (isNearTarget()) r = fixSoldOut(r); } catch (e) {}
+    try {
+      // 始终捕获 productId（不受时间窗口限制）
+      if (!_capturedProductId) captureProductIdFromData(r);
+      if (isNearTarget()) r = fixSoldOut(r);
+    } catch (e) {}
     return r;
   };
   Object.defineProperty(JSON.parse, 'toString', {
     value: () => 'function parse() { [native code] }',
   });
+
+  // 按价格+折扣识别目标套餐 (API 返回无 name 字段)
+  // Lite: monthlyOriginalAmount=49, Pro: =149, Max: =469
+  // monthly: 无折扣, quarterly: campaignName含"包季", yearly: 含"包年"
+  let _allProductIds = {};
+  const PLAN_PRICE_MAP = { lite: 49, pro: 149, max: 469 };
+
+  function identifyPlanFromProduct(item) {
+    const price = item.monthlyOriginalAmount;
+    let plan = null;
+    for (const [name, p] of Object.entries(PLAN_PRICE_MAP)) {
+      if (price === p) { plan = name; break; }
+    }
+    if (!plan) return null;
+    let period = 'monthly';
+    const campaigns = item.campaignDiscountDetails || [];
+    for (const c of campaigns) {
+      const cn = c.campaignName || '';
+      if (cn.includes('包季')) { period = 'quarterly'; break; }
+      if (cn.includes('包年')) { period = 'yearly'; break; }
+    }
+    return { plan, period };
+  }
+
+  function captureProductIdFromData(obj) {
+    if (!obj || typeof obj !== 'object') return;
+    if (obj.productList && Array.isArray(obj.productList)) {
+      for (const item of obj.productList) {
+        if (!item || !item.productId) continue;
+        const info = identifyPlanFromProduct(item);
+        if (!info) continue;
+        const key = info.plan + '_' + info.period;
+        _allProductIds[key] = item.productId;
+        if (info.plan === CONFIG.targetPlan && info.period === CONFIG.billingPeriod) {
+          _capturedProductId = item.productId;
+          log('[捕获] productId=' + item.productId + ' (' + CONFIG.targetPlan + '/' + CONFIG.billingPeriod + ')');
+        }
+      }
+      return;
+    }
+    if (Array.isArray(obj)) {
+      for (const item of obj) { if (item && typeof item === 'object') captureProductIdFromData(item); }
+    } else {
+      for (const v of Object.values(obj)) { if (v && typeof v === 'object') captureProductIdFromData(v); }
+    }
+  }
+
+  function getProductId() {
+    if (_capturedProductId) return _capturedProductId;
+    var exactKey = CONFIG.targetPlan + '_' + CONFIG.billingPeriod;
+    if (_allProductIds[exactKey]) {
+      _capturedProductId = _allProductIds[exactKey];
+      log('[回退] 精确匹配 productId=' + _capturedProductId);
+      return _capturedProductId;
+    }
+    for (const [key, pid] of Object.entries(_allProductIds)) {
+      if (key.startsWith(CONFIG.targetPlan + '_')) {
+        _capturedProductId = pid;
+        log('[回退] 同套餐匹配 productId=' + pid + ' (' + key + ')');
+        return pid;
+      }
+    }
+    const entries = Object.entries(_allProductIds);
+    if (entries.length > 0) {
+      _capturedProductId = entries[0][1];
+      log('[回退] 使用首个可用 productId=' + _capturedProductId);
+      return _capturedProductId;
+    }
+    return null;
+  }
 
   function fixSoldOut(obj) {
     if (!obj || typeof obj !== 'object') return obj;
@@ -480,9 +561,23 @@
   }
 
   function startSnipe() {
+    if (_confirmedSoldOut) {
+      log('已确认售罄，不启动抢购');
+      setStatus('已售罄，明日再抢', '#f44');
+      state.isRunning = false;
+      return;
+    }
     selectBilling();
     unlock();
     state.timerId = setInterval(() => {
+      if (_confirmedSoldOut) {
+        clearInterval(state.timerId);
+        state.timerId = null;
+        state.isRunning = false;
+        log('已确认售罄，停止抢购');
+        setStatus('已售罄，明日再抢', '#f44');
+        return;
+      }
       if (state.orderCreated) {
         clearInterval(state.timerId);
         return;
@@ -618,7 +713,7 @@
     setInterval(() => {
       const now = new Date();
       if (now.getHours() !== CONFIG.targetHour || now.getMinutes() > 30) return;
-      if (state.isRunning || state.orderCreated || state.modalVisible) return;
+      if (state.isRunning || state.orderCreated || state.modalVisible || _confirmedSoldOut) return;
 
       const bodyText = document.body?.textContent || '';
       const hasError = ['访问人数较多', '请刷新重试', '服务繁忙'].some(kw => bodyText.includes(kw));
@@ -636,26 +731,43 @@
 
   // ===== 9. Vue 组件直接操作 =====
   function ensureProductId() {
+    const pid = getProductId();
+    if (!pid) { log('[Vue] 没有捕获到 productId，无法恢复'); return; }
     const app = document.querySelector('#app');
     const vue = app?.__vue__;
     if (!vue) return;
+    let fixed = 0;
     const walk = (vm, depth) => {
-      if (depth > 8) return;
-      if (vm.$data && ('productId' in vm.$data) && !vm.$data.productId) {
-        const products = vm.$data.products || vm.$data.productList || vm.$data.planList || [];
-        for (const p of products) {
-          const name = (p.name || p.title || p.planName || '').toLowerCase();
-          if (name.includes(CONFIG.targetPlan)) {
-            vm.productId = p.productId || p.id;
-            log('[Vue] 已恢复 productId=' + vm.productId);
-            return;
+      if (depth > 10) return;
+      if (vm.$data) {
+        for (const key of Object.keys(vm.$data)) {
+          if (/product.?id/i.test(key) && !vm.$data[key]) {
+            vm[key] = _capturedProductId;
+            fixed++;
+            log('[Vue] 已设置 ' + key + '=' + _capturedProductId);
           }
         }
-        log('[Vue] productId 为空，未找到匹配的产品数据');
       }
       for (const child of (vm.$children || [])) walk(child, depth + 1);
     };
     walk(vue, 0);
+    if (fixed === 0) {
+      const walkAll = (vm, depth) => {
+        if (depth > 10 || fixed > 0) return;
+        if (vm.$data) {
+          for (const key of Object.keys(vm.$data)) {
+            if (/product.?id/i.test(key)) {
+              vm[key] = _capturedProductId;
+              fixed++;
+              log('[Vue] 强制设置 ' + key + '=' + _capturedProductId);
+              return;
+            }
+          }
+        }
+        for (const child of (vm.$children || [])) walkAll(child, depth + 1);
+      };
+      walkAll(vue, 0);
+    }
   }
 
   function forcePayDialog() {
@@ -722,12 +834,26 @@
   log('已启用: TCP预热/指纹随机化/check校验/Vue直接操作');
   setStatus('等待中...', '#aaa');
 
+  // 定期检查 productId 是否已捕获
+  const pidTimer = setInterval(() => {
+    if (_capturedProductId) { clearInterval(pidTimer); return; }
+    getProductId();
+  }, 3000);
+
   // 如果现在刚好是10:00
   const now = new Date();
-  if (now.getHours() === CONFIG.targetHour && now.getMinutes() >= CONFIG.targetMinute) {
-    log('现在就是抢购时间!');
-    state.isRunning = true;
-    startSnipe();
+  if (now.getHours() === CONFIG.targetHour && now.getMinutes() <= 30) {
+    // 延迟2秒等待 API 数据加载，以便售罄检测生效
+    setTimeout(() => {
+      if (_confirmedSoldOut) {
+        log('已确认售罄，不启动抢购');
+        setStatus('已售罄，明日再抢', '#f44');
+        return;
+      }
+      log('现在就是抢购时间!');
+      state.isRunning = true;
+      startSnipe();
+    }, 2000);
   }
 
   console.log('%c[GLM Sniper] 脚本加载成功! 看右上角悬浮窗', 'color:#0f8;font-size:16px;font-weight:bold');
