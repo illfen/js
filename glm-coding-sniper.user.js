@@ -155,6 +155,19 @@
       } catch (e) { return response; }
     }
 
+    // productId 缺失检测: preview 请求返回 productId 不能为空时，自动恢复并重试
+    if (/preview/i.test(url)) {
+      try {
+        const clone2 = response.clone();
+        const text2 = await clone2.text();
+        if (text2.includes('productId') && text2.includes('不能为空')) {
+          log('[拦截] 检测到 productId 为空，尝试恢复...');
+          ensureProductId();
+          selectBillingPeriod();
+        }
+      } catch (e) {}
+    }
+
     // check 校验: preview 请求成功时验证 bizId
     if (/preview/i.test(url)) {
       try {
@@ -260,6 +273,11 @@
         state.modalVisible = false;
         console.log('[GLM Sniper] 弹窗已消失，恢复正常');
         log('弹窗已消失，恢复自动抢购');
+        // 验证码完成后重新选择计费周期，防止产品数据丢失导致 productId 为空
+        setTimeout(() => {
+          selectBillingPeriod();
+          ensureProductId();
+        }, 500);
       }
     }).observe(document.body, { childList: true, subtree: true });
   }
@@ -419,7 +437,11 @@
 
       const el = document.getElementById('glm-countdown');
       if (el) {
-        if (diff <= 60000) {
+        // 正在抢购时段 (isRunning 或在窗口期内) 不显示倒计时
+        if (state.isRunning || isNearTargetTime()) {
+          el.textContent = '抢购中...';
+          el.style.color = '#00ff88';
+        } else if (diff <= 60000) {
           // 最后60秒显示毫秒
           el.textContent = `${s}.${String(ms).padStart(3, '0')}s`;
           el.style.color = '#ff4444';
@@ -801,9 +823,21 @@
       }
 
       _refreshCount++;
-      console.log(`[GLM Sniper] 页面异常 (第${_refreshCount}次)，强制刷新...`);
+      console.log(`[GLM Sniper] 页面异常 (第${_refreshCount}次)，尝试恢复...`);
 
-      // 直接强刷，带 cache-busting 绕缓存，不限次数
+      // 限制刷新频率：至少间隔5秒
+      const lastRefresh = parseInt(sessionStorage.getItem('glm_last_refresh') || '0');
+      if (Date.now() - lastRefresh < 5000) return;
+      sessionStorage.setItem('glm_last_refresh', String(Date.now()));
+
+      // 如果当前在限流页 (rate-limit.html)，直接跳回购买页
+      if (window.location.pathname.includes('rate-limit')) {
+        console.log('[GLM Sniper] 检测到限流页，跳回购买页...');
+        window.location.replace('https://open.bigmodel.cn/glm-coding');
+        return;
+      }
+
+      // 正常页面异常：带 cache-busting 强刷
       const url = new URL(window.location.href);
       url.searchParams.set('_t', Date.now());
       window.location.replace(url.toString());
@@ -846,6 +880,36 @@
   }
 
   // ==================== 10. Vue 组件直接操作 ====================
+
+  // 确保 Vue 组件中 productId 存在，防止验证码后数据丢失
+  function ensureProductId() {
+    const app = document.querySelector('#app');
+    const vue = app?.__vue__;
+    if (!vue) return;
+
+    const walk = (vm, depth) => {
+      if (depth > 8) return;
+      // 查找包含 productId 的组件
+      if (vm.$data) {
+        // 如果 productId 为空但有可用的产品列表，自动填充
+        if (('productId' in vm.$data) && !vm.$data.productId) {
+          // 尝试从产品列表中找到目标套餐的 productId
+          const products = vm.$data.products || vm.$data.productList || vm.$data.planList || [];
+          for (const p of products) {
+            const name = (p.name || p.title || p.planName || '').toLowerCase();
+            if (name.includes(CONFIG.targetPlan)) {
+              vm.productId = p.productId || p.id;
+              log(`[Vue] 已恢复 productId=${vm.productId}`);
+              return;
+            }
+          }
+          log('[Vue] productId 为空，未找到匹配的产品数据');
+        }
+      }
+      for (const child of (vm.$children || [])) walk(child, depth + 1);
+    };
+    walk(vue, 0);
+  }
 
   // 抢购成功后，如果支付弹窗没自动弹出，直接操作 Vue 组件
   function forcePayDialog() {

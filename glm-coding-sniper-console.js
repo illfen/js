@@ -117,6 +117,19 @@
       } catch (e) { return res; }
     }
 
+    // productId 缺失检测
+    if (/preview/i.test(url)) {
+      try {
+        const clone2 = res.clone();
+        const text2 = await clone2.text();
+        if (text2.includes('productId') && text2.includes('不能为空')) {
+          log('[拦截] 检测到 productId 为空，尝试恢复...');
+          ensureProductId();
+          selectBilling();
+        }
+      } catch (e) {}
+    }
+
     // check 校验: preview 请求成功时验证 bizId
     if (/preview/i.test(url)) {
       try {
@@ -210,6 +223,10 @@
       if (!foundRealModal && state.modalVisible) {
         state.modalVisible = false;
         log('弹窗已消失，恢复自动抢购');
+        setTimeout(() => {
+          selectBilling();
+          ensureProductId();
+        }, 500);
       }
     }).observe(document.body, { childList: true, subtree: true });
   }
@@ -322,7 +339,10 @@
     const s = Math.floor((diff % 60000) / 1000);
     const ms = diff % 1000;
 
-    if (diff <= 60000) {
+    if (state.isRunning || isNearTarget()) {
+      el.textContent = '抢购中...';
+      el.style.color = '#0f8';
+    } else if (diff <= 60000) {
       el.textContent = s + '.' + String(ms).padStart(3, '0') + 's';
       el.style.color = '#f44';
     } else {
@@ -521,6 +541,29 @@
   }
 
   // ===== 9. Vue 组件直接操作 =====
+  function ensureProductId() {
+    const app = document.querySelector('#app');
+    const vue = app?.__vue__;
+    if (!vue) return;
+    const walk = (vm, depth) => {
+      if (depth > 8) return;
+      if (vm.$data && ('productId' in vm.$data) && !vm.$data.productId) {
+        const products = vm.$data.products || vm.$data.productList || vm.$data.planList || [];
+        for (const p of products) {
+          const name = (p.name || p.title || p.planName || '').toLowerCase();
+          if (name.includes(CONFIG.targetPlan)) {
+            vm.productId = p.productId || p.id;
+            log('[Vue] 已恢复 productId=' + vm.productId);
+            return;
+          }
+        }
+        log('[Vue] productId 为空，未找到匹配的产品数据');
+      }
+      for (const child of (vm.$children || [])) walk(child, depth + 1);
+    };
+    walk(vue, 0);
+  }
+
   function forcePayDialog() {
     const app = document.querySelector('#app');
     const vue = app?.__vue__;
