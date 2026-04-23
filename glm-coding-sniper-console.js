@@ -72,6 +72,9 @@
     state.isRunning = false;
   }
 
+  // 捕获的 productId (必须在 JSON.parse 拦截之前声明，避免 let 暂时性死区)
+  let _capturedProductId = null;
+
   // ===== 1. 拦截 JSON.parse =====
   const _parse = JSON.parse;
   JSON.parse = function (...args) {
@@ -79,8 +82,11 @@
     try {
       // 始终捕获 productId（不受时间窗口限制）
       if (!_capturedProductId) captureProductIdFromData(r);
-      if (isNearTarget()) r = fixSoldOut(r);
-    } catch (e) {}
+      if (isNearTarget()) {
+        _soldOutCount = 0; // 每次新的 API 响应重置计数器
+        r = fixSoldOut(r);
+      }
+    } catch (e) { }
     return r;
   };
   Object.defineProperty(JSON.parse, 'toString', {
@@ -167,9 +173,8 @@
           obj[k] = false;
           log('[拦截] ' + k + ' -> false (连续' + _soldOutCount + '次)');
         }
-      } else if (/sold.?out/i.test(k)) {
-        _soldOutCount = 0;
       }
+      // 不在递归遍历中重置计数器，在 JSON.parse 拦截层重置
       if (k === 'isServerBusy' && obj[k] === true) {
         obj[k] = false;
         log('[拦截] isServerBusy -> false');
@@ -180,7 +185,6 @@
   }
 
   // ===== 2. 拦截 fetch (指纹随机化 + 自动重试 + soldOut修改 + check校验) =====
-  let _capturedProductId = null;
 
   const _fetch = window.fetch;
   window.fetch = async function (...args) {
@@ -196,22 +200,22 @@
 
     const url = typeof args[0] === 'string' ? args[0] : args[0]?.url || '';
 
-    // preview 请求: 捕获 productId + 注入缺失的 productId
-    if (/preview/i.test(url) && args[1]?.body) {
+    // 所有包含 body 的请求: 捕获 productId + 注入缺失的 productId
+    if (args[1]?.body && typeof args[1].body === 'string') {
       try {
-        let bodyObj = typeof args[1].body === 'string' ? JSON.parse(args[1].body) : null;
-        if (bodyObj) {
+        let bodyObj = JSON.parse(args[1].body);
+        if (bodyObj && typeof bodyObj === 'object') {
           if (bodyObj.productId) {
             _capturedProductId = bodyObj.productId;
-            log('[捕获] productId=' + _capturedProductId);
+            if (/preview/i.test(url)) log('[捕获] productId=' + _capturedProductId);
           }
-          if (!bodyObj.productId && _capturedProductId) {
+          if ('productId' in bodyObj && !bodyObj.productId && _capturedProductId) {
             bodyObj.productId = _capturedProductId;
             args[1] = { ...args[1], body: JSON.stringify(bodyObj) };
-            log('[注入] 已补充 productId=' + _capturedProductId);
+            log('[注入] 已补充 productId=' + _capturedProductId + ' → ' + url.split('/').pop());
           }
         }
-      } catch (e) {}
+      } catch (e) { }
     }
 
     let res = await _fetch.apply(this, args);
@@ -224,7 +228,7 @@
         try {
           res = await _fetch.apply(this, args);
           if (res.ok) { console.log('[GLM Sniper] fetch 重试成功!'); break; }
-        } catch (e) {}
+        } catch (e) { }
       }
     }
 
@@ -250,14 +254,70 @@
         };
         const found = findPid(parsed);
         if (found) { _capturedProductId = found; log('[捕获] 从API响应获取 productId=' + found); }
-      } catch (e) {}
+      } catch (e) { }
     }
 
-    if (!isNearTarget()) return res;
-    if (/coding|plan|order|subscribe|product|package/i.test(url)) {
-      const clone = res.clone();
+    if (!isNearTarget() || _confirmedSoldOut) return res;
+
+    // preview 请求优先处理: productId 缺失检测 + bizId 校验 + soldOut 拦截
+    if (/preview/i.test(url)) {
       try {
-        const text = await clone.text();
+        const text = await res.clone().text();
+
+        // productId 缺失检测 — 收到此错误后立即恢复并自动重试购买
+        if (text.includes('productId') && text.includes('不能为空')) {
+          log('[拦截] 检测到 "productId 不能为空"，启动恢复+重试...');
+          ensureProductId();
+          selectBilling();
+          setTimeout(function () {
+            if (!state.orderCreated) {
+              log('[拦截] productId 已恢复，自动重新点击购买...');
+              unlock();
+              clickBuy();
+            }
+          }, 300);
+        }
+
+        // bizId 校验
+        try {
+          const data = _parse(text);
+          if (data?.code === 200 && data?.data?.bizId) {
+            const valid = await checkBizId(data.data.bizId);
+            if (!valid) {
+              return new Response(JSON.stringify({ code: -1, msg: 'bizId expired' }), {
+                status: 200, headers: { 'Content-Type': 'application/json' },
+              });
+            }
+          }
+        } catch (e) { }
+
+        // soldOut 拦截 (preview 响应也可能包含 soldOut)
+        if (shouldInterceptSoldOut()) {
+          const modified = text
+            .replace(/"isSoldOut"\s*:\s*true/g, '"isSoldOut":false')
+            .replace(/"soldOut"\s*:\s*true/g, '"soldOut":false')
+            .replace(/"is_sold_out"\s*:\s*true/g, '"is_sold_out":false')
+            .replace(/"sold_out"\s*:\s*true/g, '"sold_out":false');
+          if (modified !== text) log('[拦截] 已修改 preview 响应中的售罄状态');
+          return new Response(modified, {
+            status: res.status, statusText: res.statusText, headers: res.headers,
+          });
+        }
+        return new Response(text, {
+          status: res.status, statusText: res.statusText, headers: res.headers,
+        });
+      } catch (e) { return res; }
+    }
+
+    // 非 preview 的其他 API: soldOut 拦截
+    if (/coding|plan|order|subscribe|product|package/i.test(url)) {
+      try {
+        const text = await res.clone().text();
+        if (!shouldInterceptSoldOut()) {
+          return new Response(text, {
+            status: res.status, statusText: res.statusText, headers: res.headers,
+          });
+        }
         const fixed = text
           .replace(/"isSoldOut"\s*:\s*true/g, '"isSoldOut":false')
           .replace(/"soldOut"\s*:\s*true/g, '"soldOut":false')
@@ -265,40 +325,9 @@
           .replace(/"sold_out"\s*:\s*true/g, '"sold_out":false');
         if (fixed !== text) log('[拦截] fetch 响应已修改');
         return new Response(fixed, {
-          status: res.status,
-          statusText: res.statusText,
-          headers: res.headers,
+          status: res.status, statusText: res.statusText, headers: res.headers,
         });
       } catch (e) { return res; }
-    }
-
-    // productId 缺失检测
-    if (/preview/i.test(url)) {
-      try {
-        const clone2 = res.clone();
-        const text2 = await clone2.text();
-        if (text2.includes('productId') && text2.includes('不能为空')) {
-          log('[拦截] 检测到 productId 为空，尝试恢复...');
-          ensureProductId();
-          selectBilling();
-        }
-      } catch (e) {}
-    }
-
-    // check 校验: preview 请求成功时验证 bizId
-    if (/preview/i.test(url)) {
-      try {
-        const clone = res.clone();
-        const data = await clone.json();
-        if (data?.code === 200 && data?.data?.bizId) {
-          const valid = await checkBizId(data.data.bizId);
-          if (!valid) {
-            return new Response(JSON.stringify({code: -1, msg: 'bizId expired'}), {
-              status: 200, headers: { 'Content-Type': 'application/json' },
-            });
-          }
-        }
-      } catch (e) {}
     }
 
     return res;
@@ -329,6 +358,7 @@
   XMLHttpRequest.prototype.open = function (method, url, ...rest) {
     this._sniperUrl = url;
     this._sniperMethod = method;
+    this._sniperOpenRest = rest; // 保存 async/user/password 等额外参数
     this._sniperArgs = null;
     return _xhrOpen.call(this, method, url, ...rest);
   };
@@ -336,34 +366,37 @@
   XMLHttpRequest.prototype.send = function (...args) {
     const url = this._sniperUrl || '';
 
-    // XHR preview 请求: 捕获 + 注入 productId
-    if (/preview/i.test(url) && args[0]) {
+    // XHR 请求: 捕获 + 注入 productId (所有含 productId 字段的请求)
+    if (args[0] && typeof args[0] === 'string') {
       try {
-        let bodyObj = typeof args[0] === 'string' ? JSON.parse(args[0]) : null;
-        if (bodyObj) {
+        var bodyObj = JSON.parse(args[0]);
+        if (bodyObj && typeof bodyObj === 'object') {
           if (bodyObj.productId) {
             _capturedProductId = bodyObj.productId;
-            log('[捕获] productId=' + _capturedProductId + ' (XHR)');
+            if (/preview/i.test(url)) log('[捕获] productId=' + _capturedProductId + ' (XHR)');
           }
-          if (!bodyObj.productId && _capturedProductId) {
+          if ('productId' in bodyObj && !bodyObj.productId && _capturedProductId) {
             bodyObj.productId = _capturedProductId;
             args[0] = JSON.stringify(bodyObj);
-            log('[注入] 已补充 productId=' + _capturedProductId + ' (XHR)');
+            log('[注入] 已补充 productId=' + _capturedProductId + ' (XHR) → ' + url.split('/').pop());
           }
         }
-      } catch (e) {}
+      } catch (e) { }
     }
 
     this._sniperArgs = args;
-    if (isNearTarget()) {
+    if (isNearTarget() && !this._sniperHasRetryHandler) {
+      this._sniperHasRetryHandler = true;
+      this._sniperRetryCount = 0;
       this.addEventListener('load', function xhrRetryHandler() {
-        if ([429, 500, 502, 503].includes(this.status)) {
-          console.log('[GLM Sniper] XHR ' + this.status + '，1s后重试: ' + this._sniperUrl);
+        if ([429, 500, 502, 503].includes(this.status) && this._sniperRetryCount < 8) {
+          this._sniperRetryCount++;
+          console.log('[GLM Sniper] XHR ' + this.status + '，重试' + this._sniperRetryCount + '/8: ' + this._sniperUrl);
           const self = this;
           setTimeout(() => {
-            _xhrOpen.call(self, self._sniperMethod, self._sniperUrl, true);
+            _xhrOpen.call(self, self._sniperMethod, self._sniperUrl, ...(self._sniperOpenRest || [true]));
             _xhrSend.apply(self, self._sniperArgs || []);
-          }, 1000);
+          }, 300 * this._sniperRetryCount);
         }
       });
     }
@@ -381,9 +414,9 @@
         if (modal.offsetParent === null || modal.offsetHeight < 30) continue;
         const text = modal.textContent || '';
         const isCaptcha = text.includes('验证') || text.includes('滑动') || text.includes('拖动') ||
-                          modal.querySelector('[class*="captcha"],[class*="verify"],[class*="slider-"]');
+          modal.querySelector('[class*="captcha"],[class*="verify"],[class*="slider-"]');
         const isPayment = text.includes('扫码') || text.includes('支付') || text.includes('付款') ||
-                          modal.querySelector('canvas, img[src*="qr"], img[src*="pay"]');
+          modal.querySelector('canvas, img[src*="qr"], img[src*="pay"]');
         if (isCaptcha || isPayment) {
           foundRealModal = true;
           if (!state.modalVisible) {
@@ -391,6 +424,7 @@
             log('检测到' + (isCaptcha ? '验证码' : '支付') + '弹窗，已冻结刷新');
             setStatus('请完成验证码 / 扫码支付!', '#fc0');
             playBeep();
+            highlightCaptcha(modal, isCaptcha);
           }
           break;
         }
@@ -398,10 +432,7 @@
       if (!foundRealModal && state.modalVisible) {
         state.modalVisible = false;
         log('弹窗已消失，恢复自动抢购');
-        setTimeout(() => {
-          selectBilling();
-          ensureProductId();
-        }, 500);
+        recoverAfterCaptcha();
       }
     }).observe(document.body, { childList: true, subtree: true });
   }
@@ -454,7 +485,7 @@
       <div style="font-size:16px;font-weight:bold;margin-bottom:6px">
         GLM Sniper <span style="color:#888;font-size:12px">console ver.</span>
       </div>
-      <div style="color:#fc0;margin-bottom:4px">目标: ${CONFIG.targetPlan.toUpperCase()} / ${{monthly:'包月',quarterly:'包季',yearly:'包年'}[CONFIG.billingPeriod]||'包季'}</div>
+      <div style="color:#fc0;margin-bottom:4px">目标: ${CONFIG.targetPlan.toUpperCase()} / ${{ monthly: '包月', quarterly: '包季', yearly: '包年' }[CONFIG.billingPeriod] || '包季'}</div>
       <div id="glm-cd" style="font-size:22px;margin:6px 0;color:#fff">--:--:--</div>
       <div id="glm-st" style="color:#aaa;font-size:12px">就绪</div>
       <div style="color:#f44;font-size:12px;margin-top:6px;font-weight:bold;line-height:1.4;">
@@ -488,7 +519,7 @@
     try {
       const paths = ['/favicon.ico', '/api/biz/pay/check?bizId=preheat', '/'];
       for (const p of paths) {
-        _fetch(location.origin + p, { method: 'HEAD', cache: 'no-cache', credentials: 'include' }).catch(() => {});
+        _fetch(location.origin + p, { method: 'HEAD', cache: 'no-cache', credentials: 'include' }).catch(() => { });
       }
       log('预热完成 (3条连接已建立)');
     } catch (e) {
@@ -543,9 +574,9 @@
   // ===== 6. 抢购 =====
   function selectBilling() {
     const periods = {
-      monthly:   { match: '包月', exclude: ['包季', '包年'], label: '连续包月' },
+      monthly: { match: '包月', exclude: ['包季', '包年'], label: '连续包月' },
       quarterly: { match: '包季', exclude: ['包月', '包年'], label: '连续包季' },
-      yearly:    { match: '包年', exclude: ['包月', '包季'], label: '连续包年' },
+      yearly: { match: '包年', exclude: ['包月', '包季'], label: '连续包年' },
     };
     const p = periods[CONFIG.billingPeriod] || periods.quarterly;
     for (const el of document.querySelectorAll('div,span,button,a,li,label')) {
@@ -595,6 +626,8 @@
         log('第 ' + state.retryCount + ' 次尝试...');
       }
       unlock();
+      // 有弹窗时不点击，保护验证码/支付弹窗
+      if (state.modalVisible) return;
       if (clickBuy()) {
         log('已点击购买按钮!');
         setStatus('等待响应...', '#0f8');
@@ -693,7 +726,7 @@
         if (n.nodeType !== 1) continue;
         const hasQR = n.querySelector?.('canvas,img[src*="qr"],img[src*="pay"]');
         const isModal = n.matches?.('[class*="modal"],[class*="dialog"],[role="dialog"]') ||
-                        n.closest?.('[class*="modal"],[class*="dialog"],[role="dialog"]');
+          n.closest?.('[class*="modal"],[class*="dialog"],[role="dialog"]');
         const t = n.textContent || '';
         const hasPayText = t.includes('扫码') || t.includes('支付宝') || t.includes('微信支付');
         if (hasQR || (isModal && hasPayText)) {
@@ -730,6 +763,57 @@
   }
 
   // ===== 9. Vue 组件直接操作 =====
+
+  // 验证码完成后多轮恢复 productId，防止 "productId 不能为空"
+  function recoverAfterCaptcha() {
+    log('[恢复] 验证码完成，开始多轮恢复 productId...');
+    // 第1轮: 立即恢复
+    selectBilling();
+    ensureProductId();
+    // 第2轮: 200ms 后 (等 Vue 渲染)
+    setTimeout(function () { ensureProductId(); unlock(); }, 200);
+    // 第3轮: 500ms 后，若 productId 仍为空则重新请求
+    setTimeout(function () {
+      ensureProductId();
+      if (!_capturedProductId) {
+        log('[恢复] productId 仍为空，尝试重新获取产品数据...');
+        refetchProductData();
+      }
+    }, 500);
+    // 第4轮: 1500ms 后最终检查
+    setTimeout(function () {
+      ensureProductId();
+      if (!_capturedProductId) {
+        log('[恢复] productId 持续为空，触发 SPA 路由重载...');
+        var cur = window.location.href;
+        window.history.pushState(null, '', cur);
+        window.dispatchEvent(new PopStateEvent('popstate', { state: null }));
+      } else {
+        log('[恢复] productId 已恢复: ' + _capturedProductId);
+      }
+    }, 1500);
+  }
+
+  function refetchProductData() {
+    var paths = ['/api/biz/product/batch-preview', '/api/biz/product/list', '/api/glm-coding/product'];
+    paths.forEach(function (path) {
+      _fetch(location.origin + path, { method: 'GET', credentials: 'include', headers: { 'Accept': 'application/json' } })
+        .then(function (resp) {
+          if (!resp.ok || _capturedProductId) return;
+          return resp.text();
+        })
+        .then(function (text) {
+          if (!text || _capturedProductId) return;
+          try { JSON.parse(text); } catch (e) { }
+          if (_capturedProductId) {
+            log('[恢复] 从 ' + path + ' 重新获取到 productId=' + _capturedProductId);
+            ensureProductId();
+          }
+        })
+        .catch(function () { });
+    });
+  }
+
   function ensureProductId() {
     const pid = getProductId();
     if (!pid) { log('[Vue] 没有捕获到 productId，无法恢复'); return; }
@@ -810,16 +894,178 @@
     }, 500);
   }
 
+  let _audioCtx = null;
   function playBeep() {
     try {
-      const c = new AudioContext();
-      [0, 0.3, 0.6].forEach(d => {
+      if (!_audioCtx) _audioCtx = new AudioContext();
+      const c = _audioCtx;
+      const freqs = [660, 880, 1100, 880, 1100];
+      freqs.forEach((freq, i) => {
         const o = c.createOscillator(), g = c.createGain();
         o.connect(g); g.connect(c.destination);
-        o.frequency.value = 880; g.gain.value = 0.3;
-        o.start(c.currentTime + d); o.stop(c.currentTime + d + 0.15);
+        o.frequency.value = freq; g.gain.value = 0.4;
+        const t = c.currentTime + i * 0.18;
+        o.start(t); o.stop(t + 0.12);
       });
-    } catch (e) {}
+    } catch (e) { }
+  }
+
+  function highlightCaptcha(modal, isCaptcha) {
+    try {
+      modal.scrollIntoView({ behavior: 'instant', block: 'center' });
+      modal.style.outline = '3px solid #ff0';
+      modal.style.outlineOffset = '2px';
+      modal.style.boxShadow = '0 0 30px rgba(255,255,0,0.6)';
+      if (!document.getElementById('glm-captcha-pulse')) {
+        const s = document.createElement('style');
+        s.id = 'glm-captcha-pulse';
+        s.textContent = '@keyframes glm-pulse{0%,100%{outline-color:#ff0;box-shadow:0 0 20px rgba(255,255,0,.4)}50%{outline-color:#f80;box-shadow:0 0 40px rgba(255,128,0,.7)}}.glm-captcha-highlight{animation:glm-pulse .8s ease-in-out infinite!important;outline:3px solid #ff0!important;outline-offset:2px!important}';
+        document.head.appendChild(s);
+      }
+      modal.classList.add('glm-captcha-highlight');
+      if (isCaptcha) {
+        setStatus('⚡ 检测到验证码，尝试自动识别...', '#ff0');
+        setTimeout(() => tryAutoSolveCaptcha(modal), 500);
+      }
+      const cleanup = () => {
+        if (!state.modalVisible) {
+          modal.classList.remove('glm-captcha-highlight');
+          modal.style.outline = modal.style.outlineOffset = modal.style.boxShadow = '';
+        } else setTimeout(cleanup, 500);
+      };
+      setTimeout(cleanup, 500);
+    } catch (e) { }
+  }
+
+  // ===== 6b. 文字点选验证码自动识别 =====
+  const CAPTCHA_API = 'http://127.0.0.1:9898/solve';
+
+  async function tryAutoSolveCaptcha(modal) {
+    try {
+      log('[自动验证码] 开始识别文字点选...');
+      let imgEl = modal.querySelector(
+        'img[class*="captcha"],img[class*="bg"],img[class*="pic"],' +
+        'img[class*="verify"],img[src*="captcha"],img[src*="verify"],' +
+        'canvas[class*="captcha"],canvas[class*="bg"]'
+      );
+      if (!imgEl) {
+        const cands = [...modal.querySelectorAll('img,canvas')]
+          .filter(el => el.offsetWidth > 100 && el.offsetHeight > 80);
+        cands.sort((a, b) => (b.offsetWidth * b.offsetHeight) - (a.offsetWidth * a.offsetHeight));
+        imgEl = cands[0] || null;
+      }
+      if (!imgEl) { log('[自动验证码] 未找到图片，请手动完成'); setStatus('⚠ 请手动点击验证码', '#f44'); return false; }
+
+      const promptText = extractTargetChars(modal);
+      log('[自动验证码] 目标文字: "' + promptText + '"');
+
+      const imgB64 = await elemToB64(imgEl);
+      if (!imgB64) { log('[自动验证码] 无法获取图片'); return false; }
+
+      let promptImgB64 = '';
+      if (!promptText) {
+        const pi = modal.querySelector('img[class*="tip"],img[class*="prompt"],img[class*="word"]');
+        if (pi) promptImgB64 = await elemToB64(pi) || '';
+      }
+
+      log('[自动验证码] 发送给 OCR 服务器...');
+      setStatus('⏳ OCR 识别中...', '#ff0');
+
+      let result;
+      try {
+        const resp = await _fetch(CAPTCHA_API, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ image: imgB64, target: promptText, prompt_image: promptImgB64 }),
+        });
+        result = await resp.json();
+      } catch (e) {
+        log('[自动验证码] ⚠ OCR 服务未启动! 请运行: cd captcha-server && python server.py');
+        setStatus('⚠ OCR 未连接，请手动点击', '#f44');
+        return false;
+      }
+
+      if (!result.success || !result.points || result.points.length === 0) {
+        log('[自动验证码] OCR 识别失败'); setStatus('⚠ 识别失败，请手动点击', '#f44'); return false;
+      }
+
+      log('[自动验证码] 识别到 ' + result.points.length + ' 个点位 (' + result.time_ms + 'ms)');
+
+      const rect = imgEl.getBoundingClientRect();
+      const nw = imgEl.naturalWidth || imgEl.width || rect.width;
+      const nh = imgEl.naturalHeight || imgEl.height || rect.height;
+      const sx = rect.width / nw, sy = rect.height / nh;
+
+      for (let i = 0; i < result.points.length; i++) {
+        const pt = result.points[i];
+        const cx = rect.left + pt.x * sx + (Math.random() - 0.5) * 6;
+        const cy = rect.top + pt.y * sy + (Math.random() - 0.5) * 6;
+        if (i > 0) await new Promise(r => setTimeout(r, 200 + Math.random() * 200));
+        log('[自动验证码] 点击第' + (i + 1) + '个: "' + pt.char + '"');
+        simClick(cx, cy);
+      }
+
+      await new Promise(r => setTimeout(r, 300 + Math.random() * 200));
+      for (const btn of modal.querySelectorAll('button,[class*="confirm"],[class*="submit"]')) {
+        const t = (btn.textContent || '').trim();
+        if (t.includes('确') || t.includes('提交') || t.includes('验证') || t.length <= 4) {
+          log('[自动验证码] 点击确认: "' + t + '"'); btn.click(); break;
+        }
+      }
+
+      await new Promise(r => setTimeout(r, 1200));
+      if (modal.offsetParent !== null && modal.offsetHeight > 30 && state.modalVisible) {
+        log('[自动验证码] 未通过，等待重试...');
+        setTimeout(() => { if (state.modalVisible) tryAutoSolveCaptcha(modal); }, 2000);
+        return false;
+      }
+      log('[自动验证码] ✅ 验证通过!');
+      return true;
+    } catch (e) { log('[自动验证码] 异常: ' + e.message); return false; }
+  }
+
+  function extractTargetChars(modal) {
+    const txt = modal.textContent || '';
+    const pats = [
+      /请[依按]?[次顺]?[序]?点击[：:\s]*[「【""]?([^\n」】""]{1,10})[」】"""]?/,
+      /点击[：:\s]*[「【""]?([^\n」】""]{1,10})[」】"""]?/,
+      /请[依按]?[次顺]?[序]?选择[：:\s]*[「【""]?([^\n」】""]{1,10})[」】"""]?/,
+    ];
+    for (const p of pats) { const m = txt.match(p); if (m && m[1]) return m[1].replace(/[^\u4e00-\u9fff]/g, ''); }
+    let chars = '';
+    for (const el of modal.querySelectorAll('span,em,b,strong')) {
+      const t = (el.textContent || '').trim();
+      if (t.length === 1 && /[\u4e00-\u9fff]/.test(t)) chars += t;
+    }
+    return chars;
+  }
+
+  async function elemToB64(el) {
+    try {
+      if (el.tagName === 'CANVAS') return el.toDataURL('image/png').split(',')[1];
+      const cv = document.createElement('canvas'), cx = cv.getContext('2d');
+      if (!el.complete) await new Promise(r => { el.onload = r; setTimeout(r, 3000); });
+      cv.width = el.naturalWidth || el.width; cv.height = el.naturalHeight || el.height;
+      cx.drawImage(el, 0, 0);
+      return cv.toDataURL('image/png').split(',')[1];
+    } catch (e) {
+      try {
+        const src = el.src || el.currentSrc; if (!src) return null;
+        const resp = await _fetch(src, { credentials: 'include' });
+        const blob = await resp.blob();
+        return new Promise(r => { const fr = new FileReader(); fr.onloadend = () => r(fr.result.split(',')[1]); fr.readAsDataURL(blob); });
+      } catch (e2) { return null; }
+    }
+  }
+
+  function simClick(x, y) {
+    const t = document.elementFromPoint(x, y); if (!t) return;
+    const o = { clientX: x, clientY: y, bubbles: true, cancelable: true };
+    t.dispatchEvent(new PointerEvent('pointerdown', o));
+    t.dispatchEvent(new MouseEvent('mousedown', o));
+    t.dispatchEvent(new PointerEvent('pointerup', o));
+    t.dispatchEvent(new MouseEvent('mouseup', o));
+    t.dispatchEvent(new MouseEvent('click', o));
   }
 
   // ===== 10. 启动 =====

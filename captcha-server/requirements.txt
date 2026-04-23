@@ -1,0 +1,10 @@
+ddddocr>=1.4.11
+paddlepaddle
+paddleocr
+flask>=3.0
+flask-cors>=4.0
+Pillow>=10.0
+onnxruntime>=1.16
+requests>=2.31
+opencv-python>=4.6
+numpy>=1.24,<2
