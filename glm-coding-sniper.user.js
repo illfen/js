@@ -567,22 +567,40 @@
         if (modal.offsetParent === null || modal.offsetHeight < 30) continue;
         const text = modal.textContent || '';
         const hasCaptchaWidget = modal.querySelector('[class*="captcha"],[class*="tcaptcha"],[class*="slider-"]');
-        if (text.includes('点击') || text.includes('验证') || text.includes('滑动') || text.includes('拖动') || hasCaptchaWidget) {
-          // 含验证码特征且不仅仅是支付页
-          if (!(text.includes('扫码') || text.includes('付款')) || text.includes('点击')) {
-            captchaModal = modal;
-          }
+        const isPaymentContent = text.includes('实付金额') || text.includes('支付宝') || text.includes('扫码支付') || text.includes('连续包') || text.includes('账号使用规范');
+        if (!isPaymentContent && (text.includes('点击') || text.includes('验证') || text.includes('滑动') || text.includes('拖动') || hasCaptchaWidget)) {
+          captchaModal = modal;
         }
         const hasQrImg = !!modal.querySelector('img[src*="qr"], img[src*="pay"]');
         if (text.includes('扫码') || text.includes('支付') || text.includes('付款') || hasQrImg) {
           paymentModal = modal;
         }
       }
-      // 验证码优先: 如果同时存在验证码和支付弹窗，处理验证码
+      // 如果付款弹窗已出现（含实付金额/扫码支付等），说明验证码已通过，优先付款
+      if (captchaModal && paymentModal) {
+        const payText = paymentModal.textContent || '';
+        if (payText.includes('实付金额') || payText.includes('扫码支付') || payText.includes('连续包') || payText.includes('支付宝')) {
+          captchaModal = null; // 验证码已完成，清除引用
+        }
+      }
       const activeModal = captchaModal || paymentModal;
       const isCaptcha = !!captchaModal;
       const isPayment = !captchaModal && !!paymentModal;
-      if (activeModal) {
+      // 付款页面可见时，强制切换到支付状态，不再触发任何验证码逻辑
+      const paymentVisible = isPaymentModalVisible();
+      if (paymentVisible && state._lastModalType !== '支付') {
+        state.modalVisible = true;
+        state._lastModalType = '支付';
+        _captchaCompleted = true;
+        stopCaptchaWatch(paymentModal || activeModal);
+        _captchaSolving = false;
+        _captchaRetryCount = 0;
+        log('验证码通过，进入支付页');
+        setStatus('请扫码支付!', '#00ff88');
+        playAlert();
+      } else if (paymentVisible || _captchaCompleted) {
+        // 已经通过验证码，忽略残留的验证码DOM
+      } else if (activeModal) {
         const type = isCaptcha ? '验证码' : '支付';
         if (!state.modalVisible) {
           state.modalVisible = true;
@@ -597,13 +615,6 @@
           log('检测到验证码弹窗，重新识别');
           setStatus('⚡ 再次检测到验证码，自动识别...', '#ff0');
           highlightCaptcha(captchaModal, true);
-        } else if (isPayment && state._lastModalType === '验证码') {
-          state._lastModalType = '支付';
-          stopCaptchaWatch(paymentModal);
-          _captchaSolving = false;
-          _captchaRetryCount = 0;
-          log('验证码通过，进入支付页');
-          setStatus('请扫码支付!', '#00ff88');
         }
       }
       // 没有真正的弹窗了
@@ -966,6 +977,7 @@
   }
 
   function startSnipe() {
+    _captchaCompleted = false; // 新一轮抢购，重置验证码状态
     // 已确认售罄时不启动抢购
     if (_confirmedSoldOut) {
       log('已确认售罄，不启动抢购');
@@ -1317,11 +1329,31 @@
   const CAPTCHA_API = 'http://127.0.0.1:9898/solve';
   let _captchaSolving = false; // 防止并发请求
   let _captchaRetryCount = 0; // 刷新重试计数
+  let _captchaCompleted = false; // 验证码已通过，不再重新进入验证码模式
   const MAX_CAPTCHA_RETRIES = 5; // 最多自动刷新5次
   let _lastCaptchaImgKey = ''; // 上次发送的图片标识，避免重复 OCR 同一张图
 
+  function isPaymentModalVisible() {
+    const modals = document.querySelectorAll('[class*="modal"],[class*="dialog"],[class*="popup"],[role="dialog"]');
+    for (const m of modals) {
+      if (m.offsetParent === null || m.offsetHeight < 30) continue;
+      const t = m.textContent || '';
+      if ((t.includes('实付金额') || t.includes('扫码支付') || t.includes('连续包')) && !m.querySelector('[class*="tcaptcha"]')) return true;
+    }
+    return false;
+  }
+
   async function tryAutoSolveCaptcha(modal) {
     if (_captchaSolving) { log('[自动验证码] 上一次识别还在进行中，跳过'); return false; }
+    if (isPaymentModalVisible()) {
+      log('[自动验证码] 检测到付款页面，停止OCR');
+      stopCaptchaWatch(modal);
+      _captchaSolving = false;
+      _captchaRetryCount = 0;
+      state._lastModalType = '支付';
+      setStatus('请扫码支付!', '#00ff88');
+      return false;
+    }
     _captchaSolving = true;
     try {
       log('[自动验证码] 开始识别文字点选...');
