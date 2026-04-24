@@ -1009,11 +1009,11 @@
         log(`第 ${state.retryCount} 次尝试...`);
       }
 
-      // 移除disabled
-      removeAllDisabled();
-
-      // 有弹窗时不点击，保护验证码/支付弹窗
+      // 有弹窗时不操作，保护验证码/支付弹窗
       if (state.modalVisible) return;
+
+      // 移除disabled (弹窗关闭后才执行，避免破坏验证码SDK)
+      removeAllDisabled();
 
       // 每次点击前确保 Vue 组件的 productId 已设置
       // (关键! 前端验证在请求发出前检查，fetch拦截器来不及)
@@ -1940,7 +1940,7 @@
     }
   }
 
-  // 确保 Vue 组件中 productId 存在，防止验证码后数据丢失
+  // 确保 Vue 组件/Store 中 productId 存在，防止脚本点击时数据为空
   let _ensureThrottle = 0;
   function ensureProductId() {
     const pid = getProductId();
@@ -1951,60 +1951,94 @@
     if (!vue) return;
 
     let fixed = 0;
-    const walk = (vm, depth) => {
-      if (depth > 10) return;
-      if (vm.$data) {
-        // 搜索顶层 productId 字段
-        for (const key of Object.keys(vm.$data)) {
-          if (/product.?id/i.test(key) && !vm.$data[key]) {
-            vm[key] = _capturedProductId;
+
+    // === 策略1: 在匿名页面组件中填充 selectCardData ===
+    // 手动点击时 Vue 自动填充此字段；脚本点击时为空
+    const findPageComp = (vm, depth) => {
+      if (depth > 5 || fixed > 0) return;
+      if (vm.$data && vm.$data.selectCardData !== undefined && vm.$data.allCurrentProducts !== undefined) {
+        // 找到了页面主组件
+        const products = vm.$data.allCurrentProducts;
+        if (Array.isArray(products)) {
+          // 从 allCurrentProducts 找到目标产品
+          const target = products.find(p => p && p.productId === pid);
+          if (target) {
+            if (vm.$set) {
+              vm.$set(vm.$data, 'selectCardData', target);
+              vm.$set(vm.$data, 'currentCardData', target);
+            } else {
+              vm.selectCardData = target;
+              vm.currentCardData = target;
+            }
             fixed++;
+            log(`[ensureProductId] ✅ 注入 selectCardData (productId=${pid})`);
+          } else {
+            // allCurrentProducts 里没找到，直接设 productId
+            const cardData = { ...vm.$data.selectCardData, productId: pid };
+            if (vm.$set) vm.$set(vm.$data, 'selectCardData', cardData);
+            else vm.selectCardData = cardData;
+            fixed++;
+            log(`[ensureProductId] ✅ 强制设置 selectCardData.productId=${pid}`);
           }
+        } else {
+          // allCurrentProducts 不是数组，直接注入
+          const cardData = { ...vm.$data.selectCardData, productId: pid };
+          if (vm.$set) vm.$set(vm.$data, 'selectCardData', cardData);
+          else vm.selectCardData = cardData;
+          fixed++;
+          log(`[ensureProductId] ✅ 强制设置 selectCardData.productId=${pid}`);
         }
-        // 搜索嵌套对象中的 productId (如 formData.productId)
-        for (const key of Object.keys(vm.$data)) {
-          const val = vm.$data[key];
-          if (val && typeof val === 'object' && !Array.isArray(val)) {
-            for (const subKey of Object.keys(val)) {
-              if (/product.?id/i.test(subKey) && !val[subKey]) {
-                val[subKey] = _capturedProductId;
-                fixed++;
-              }
+      }
+      for (const child of (vm.$children || [])) findPageComp(child, depth + 1);
+    };
+    findPageComp(vue, 0);
+
+    // === 策略2: Vuex Store Pay 模块注入 ===
+    if (vue.$store && vue.$store.state.Pay) {
+      const payState = vue.$store.state.Pay;
+      const payKeys = Object.keys(payState);
+      for (const key of payKeys) {
+        if (/product.?id/i.test(key) && !payState[key]) {
+          payState[key] = pid;
+          fixed++;
+          log(`[ensureProductId] ✅ 注入 $store.state.Pay.${key}=${pid}`);
+        }
+      }
+      // 检查嵌套对象
+      for (const key of payKeys) {
+        const val = payState[key];
+        if (val && typeof val === 'object' && !Array.isArray(val)) {
+          for (const subKey of Object.keys(val)) {
+            if (/product.?id/i.test(subKey) && !val[subKey]) {
+              val[subKey] = pid;
+              fixed++;
+              log(`[ensureProductId] ✅ 注入 $store.state.Pay.${key}.${subKey}=${pid}`);
             }
           }
         }
       }
-      for (const child of (vm.$children || [])) walk(child, depth + 1);
-    };
-    walk(vue, 0);
+    }
 
-    if (fixed === 0) {
-      // 广搜: 强制覆盖所有 productId 字段（不管是否为空）
-      const walkAll = (vm, depth) => {
-        if (depth > 10 || fixed > 0) return;
-        if (vm.$data) {
-          for (const key of Object.keys(vm.$data)) {
-            if (/product.?id/i.test(key)) {
-              vm[key] = _capturedProductId;
-              fixed++;
-              return;
-            }
-            // 嵌套对象
-            const val = vm.$data[key];
-            if (val && typeof val === 'object' && !Array.isArray(val)) {
-              for (const subKey of Object.keys(val)) {
-                if (/product.?id/i.test(subKey)) {
-                  val[subKey] = _capturedProductId;
-                  fixed++;
-                  return;
-                }
-              }
-            }
+    // === 策略3: PayComponent 的 priceData 注入 ===
+    const findPayComp = (vm, depth) => {
+      if (depth > 8) return;
+      const name = vm.$options?.name || '';
+      if (name === 'PayComponent' && vm.$data) {
+        if (vm.$data.priceData && typeof vm.$data.priceData === 'object') {
+          if (!vm.$data.priceData.productId) {
+            if (vm.$set) vm.$set(vm.$data.priceData, 'productId', pid);
+            else vm.$data.priceData.productId = pid;
+            fixed++;
+            log(`[ensureProductId] ✅ 注入 PayComponent.priceData.productId=${pid}`);
           }
         }
-        for (const child of (vm.$children || [])) walkAll(child, depth + 1);
-      };
-      walkAll(vue, 0);
+      }
+      for (const child of (vm.$children || [])) findPayComp(child, depth + 1);
+    };
+    findPayComp(vue, 0);
+
+    if (fixed === 0) {
+      log(`[ensureProductId] ⚠ 未找到注入点 (pid=${pid})`);
     }
   }
 
