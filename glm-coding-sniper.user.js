@@ -95,11 +95,12 @@
     if (_confirmedSoldOut) return false;
     if (CONFIG.testMode) return true; // 测试模式无条件拦截
     if (isInRushWindow()) return true; // 前2分钟无条件拦截
-    // 2分钟后：连续3次soldOut → 快速确认售罄（每次API调用约3个plan，1次调用即可确认）
+    // 2分钟后：本次响应中所有产品都售罄 → 确认售罄，停止拦截
     if (_soldOutCount >= 3) {
       confirmSoldOut();
       return false;
     }
+    // 部分售罄（<3），继续拦截
     return true;
   }
 
@@ -133,8 +134,11 @@
       }
       // soldOut 拦截 (testMode 下始终生效)
       if (CONFIG.testMode || isNearTargetTime()) {
-        _soldOutCount = 0; // 每次新的 API 响应重置计数器
-        result = deepModifySoldOut(result);
+        // 先统计本次响应中有多少个 soldOut，再统一决定是否拦截
+        _soldOutCount = countSoldOut(result);
+        if (shouldInterceptSoldOut()) {
+          result = deepModifySoldOut(result);
+        }
       }
     } catch (e) {
       // 静默失败，不影响页面正常功能
@@ -254,6 +258,22 @@
     return null;
   }
 
+  // 统计对象中 soldOut 为 true 的数量
+  function countSoldOut(obj) {
+    if (obj === null || typeof obj !== 'object') return 0;
+    if (Array.isArray(obj)) return obj.reduce((n, item) => n + countSoldOut(item), 0);
+    let count = 0;
+    for (const key of Object.keys(obj)) {
+      if ((key === 'isSoldOut' || key === 'soldOut' || key === 'is_sold_out' || key === 'sold_out') && obj[key] === true) {
+        count++;
+      }
+      if (typeof obj[key] === 'object' && obj[key] !== null) {
+        count += countSoldOut(obj[key]);
+      }
+    }
+    return count;
+  }
+
   function deepModifySoldOut(obj) {
     if (obj === null || typeof obj !== 'object') return obj;
 
@@ -269,14 +289,9 @@
         key === 'sold_out'
       ) {
         if (obj[key] === true) {
-          _soldOutCount++;
-          if (shouldInterceptSoldOut()) {
-            obj[key] = false;
-            log(`[拦截] 将 ${key} 从 true 改为 false (连续${_soldOutCount}次)`);
-          }
+          obj[key] = false;
+          log(`[拦截] 将 ${key} 从 true 改为 false`);
         }
-        // 不在递归遍历中重置计数器，在 JSON.parse 拦截层重置（每次新响应开始时）
-
       }
       if (key === 'isServerBusy' && obj[key] === true) {
         obj[key] = false;
