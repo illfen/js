@@ -53,7 +53,7 @@
     autoRefresh: true,
     autoRefreshSecondsBefore: 10,
     // 测试模式: 设为 true 则始终拦截 soldOut (不限时间窗口)，测试完记得关掉
-    testMode: true,
+    testMode: false,
   };
 
   // ==================== 状态 ====================
