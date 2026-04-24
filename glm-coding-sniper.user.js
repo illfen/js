@@ -440,22 +440,7 @@
           }
         } catch (e) { }
 
-        // soldOut 拦截 (preview 响应也可能包含 soldOut 字段)
-        if (shouldInterceptSoldOut()) {
-          const modified = text
-            .replace(/"isSoldOut"\s*:\s*true/g, '"isSoldOut":false')
-            .replace(/"soldOut"\s*:\s*true/g, '"soldOut":false')
-            .replace(/"is_sold_out"\s*:\s*true/g, '"is_sold_out":false')
-            .replace(/"sold_out"\s*:\s*true/g, '"sold_out":false')
-            .replace(/"disabled"\s*:\s*true/g, '"disabled":false')
-            .replace(/"stock"\s*:\s*0/g, '"stock":999');
-          if (modified !== text) log('[拦截] 已修改 preview 响应中的售罄/库存状态');
-          return new Response(modified, {
-            status: response.status,
-            statusText: response.statusText,
-            headers: response.headers,
-          });
-        }
+        // soldOut 拦截统一由 JSON.parse 层处理（确保 countSoldOut 能看到原始值）
         return new Response(text, {
           status: response.status,
           statusText: response.statusText,
@@ -464,33 +449,8 @@
       } catch (e) { return response; }
     }
 
-    // 非 preview 的其他 API: soldOut 拦截
-    if (/coding|plan|order|subscribe|product|package/i.test(url)) {
-      try {
-        const text = await response.clone().text();
-        if (!shouldInterceptSoldOut()) {
-          return new Response(text, {
-            status: response.status,
-            statusText: response.statusText,
-            headers: response.headers,
-          });
-        }
-        const modified = text
-          .replace(/"isSoldOut"\s*:\s*true/g, '"isSoldOut":false')
-          .replace(/"soldOut"\s*:\s*true/g, '"soldOut":false')
-          .replace(/"is_sold_out"\s*:\s*true/g, '"is_sold_out":false')
-          .replace(/"sold_out"\s*:\s*true/g, '"sold_out":false')
-          .replace(/"disabled"\s*:\s*true/g, '"disabled":false')
-          .replace(/"stock"\s*:\s*0/g, '"stock":999');
-        if (modified !== text) log('[拦截] 已修改 fetch 响应中的售罄/库存状态');
-        return new Response(modified, {
-          status: response.status,
-          statusText: response.statusText,
-          headers: response.headers,
-        });
-      } catch (e) { return response; }
-    }
-
+    // soldOut 拦截统一由 JSON.parse 层处理，fetch 层不再做字符串替换
+    // 这样 countSoldOut 能看到原始 soldOut 值，confirmSoldOut 才能正确触发
     return response;
   };
 
@@ -613,8 +573,16 @@
         log('验证码通过，进入支付页');
         setStatus('请扫码支付!', '#00ff88');
         playAlert();
-      } else if (paymentVisible || _captchaCompleted) {
-        // 已经通过验证码，忽略残留的验证码DOM
+      } else if (_captchaCompleted && !paymentVisible) {
+        // 验证码已完成且付款弹窗已关闭 → 恢复正常状态（不被残留验证码DOM卡住）
+        if (state.modalVisible) {
+          state.modalVisible = false;
+          state._lastModalType = null;
+          log('验证码/支付流程结束，恢复正常');
+          recoverAfterCaptcha();
+        }
+      } else if (paymentVisible) {
+        // 付款中，静默等待
       } else if (activeModal) {
         const type = isCaptcha ? '验证码' : '支付';
         if (!state.modalVisible) {
@@ -852,8 +820,9 @@
     const logEl = document.getElementById('glm-log');
     if (logEl) {
       const time = new Date().toLocaleTimeString('zh-CN', { hour12: false });
-      logEl.innerHTML =
-        `<div>${time} ${msg}</div>` + logEl.innerHTML;
+      const entry = document.createElement('div');
+      entry.textContent = `${time} ${msg}`;
+      logEl.insertBefore(entry, logEl.firstChild);
       // 限制日志条数
       if (logEl.children.length > 20) {
         logEl.removeChild(logEl.lastChild);
@@ -1005,6 +974,9 @@
     selectBillingPeriod();
     // 移除所有disabled属性
     removeAllDisabled();
+
+    // 防止重复创建定时器（泄漏旧定时器）
+    if (state.timerId) { clearInterval(state.timerId); state.timerId = null; }
 
     // 开始循环尝试点击
     state.timerId = setInterval(() => {
