@@ -44,13 +44,6 @@ python server.py
 3. 10:00 脚本自动点击购买 → 自动过验证码 → 弹出支付二维码
 4. 听到提示音后**立即扫码付款**
 
-### 控制台版（备选）
-
-Tampermonkey 不可用时，可直接粘贴到 F12 Console：
-
-1. **9:59** 打开购买页面并登录
-2. `F12` → Console → 粘贴 `glm-coding-sniper-console.js` 全部内容 → 回车
-3. 看到悬浮窗 = 成功（刷新页面后需重新粘贴）
 
 ## 配置
 
@@ -84,7 +77,6 @@ const CONFIG = {
 
 ```
 ├── glm-coding-sniper.user.js      # 油猴脚本（主文件）
-├── glm-coding-sniper-console.js   # 控制台版
 └── captcha-server/
     ├── server.py                   # 验证码 OCR 服务
     └── requirements.txt            # Python 依赖
